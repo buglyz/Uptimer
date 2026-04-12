@@ -866,12 +866,13 @@ const HOMEPAGE_DATA_SNAPSHOT_SQL = `
         m.name,
         m.type,
         m.group_name,
-        m.group_sort_order,
-        m.sort_order,
-        m.interval_sec,
-        COALESCE(s.status, 'unknown') AS state_status,
-        s.last_checked_at,
-        CASE WHEN am.monitor_id IS NULL THEN 0 ELSE 1 END AS in_maintenance
+	        m.group_sort_order,
+	        m.sort_order,
+	        m.interval_sec,
+	        m.created_at,
+	        COALESCE(s.status, 'unknown') AS state_status,
+	        s.last_checked_at,
+	        CASE WHEN am.monitor_id IS NULL THEN 0 ELSE 1 END AS in_maintenance
       FROM monitors m
       LEFT JOIN monitor_state s ON s.monitor_id = m.id
       LEFT JOIN active_maintenance am ON am.monitor_id = m.id
@@ -950,10 +951,305 @@ const HOMEPAGE_DATA_SNAPSHOT_SQL = `
       )
       GROUP BY monitor_id
     ),
+    rollup_meta AS (
+      SELECT
+        ?1 AS now_sec,
+        (CAST(?1 / 86400 AS INTEGER) * 86400) AS today_start,
+        (SELECT MIN(created_at) FROM presentation) AS earliest_created_at
+    ),
     rollup_range AS (
       SELECT
-        (CAST(?1 / 86400 AS INTEGER) * 86400) AS end_day_start,
-        (CAST(?1 / 86400 AS INTEGER) * 86400) - (30 * 86400) AS start_day_start
+        now_sec,
+        today_start AS end_day_start,
+        today_start,
+        range_start_at,
+        CASE
+          WHEN now_sec > today_start AND today_start >= range_start_at THEN 1
+          ELSE 0
+        END AS needs_today
+      FROM (
+        SELECT
+          now_sec,
+          today_start,
+          CASE
+            WHEN earliest_created_at IS NULL THEN now_sec - (30 * 86400)
+            WHEN (now_sec - (30 * 86400)) > earliest_created_at THEN (now_sec - (30 * 86400))
+            ELSE earliest_created_at
+          END AS range_start_at
+        FROM rollup_meta
+      )
+    ),
+    max_interval AS (
+      SELECT COALESCE(MAX(interval_sec), 0) AS max_interval_sec
+      FROM presentation
+    ),
+    checks_window AS (
+      SELECT
+        CASE
+          WHEN rr.today_start - (mi.max_interval_sec * 2) > 0
+          THEN rr.today_start - (mi.max_interval_sec * 2)
+          ELSE 0
+        END AS checks_start
+      FROM rollup_range rr
+      CROSS JOIN max_interval mi
+    ),
+    today_base AS (
+      SELECT
+        p.id AS monitor_id,
+        p.interval_sec,
+        p.created_at,
+        p.last_checked_at,
+        rr.now_sec,
+        rr.today_start,
+        rr.needs_today,
+        cw.checks_start AS checks_window_start,
+        CASE
+          WHEN p.created_at > rr.today_start THEN p.created_at
+          ELSE rr.today_start
+        END AS monitor_start
+      FROM presentation p
+      CROSS JOIN rollup_range rr
+      CROSS JOIN checks_window cw
+    ),
+    today_first_checks AS (
+      SELECT
+        c.monitor_id,
+        MIN(c.checked_at) AS first_check_at
+      FROM check_results c
+      JOIN today_base t ON t.monitor_id = c.monitor_id
+      WHERE t.needs_today = 1
+        AND c.checked_at >= t.monitor_start
+        AND c.checked_at < t.now_sec
+      GROUP BY c.monitor_id
+    ),
+    today_effective_start AS (
+      SELECT
+        t.monitor_id,
+        t.interval_sec,
+        t.created_at,
+        t.last_checked_at,
+        t.now_sec,
+        t.today_start,
+        t.needs_today,
+        t.monitor_start,
+        CASE
+          WHEN t.needs_today = 0 THEN NULL
+          WHEN t.created_at <= t.today_start THEN t.today_start
+          ELSE COALESCE(
+            fc.first_check_at,
+            CASE
+              WHEN t.last_checked_at IS NULL THEN NULL
+              ELSE t.monitor_start
+            END
+          )
+        END AS effective_start,
+        CASE
+          WHEN t.created_at > t.today_start THEN t.monitor_start
+          ELSE t.checks_window_start
+        END AS checks_start
+      FROM today_base t
+      LEFT JOIN today_first_checks fc ON fc.monitor_id = t.monitor_id
+    ),
+    today_checks AS (
+      SELECT
+        c.monitor_id,
+        c.id AS check_id,
+        c.checked_at,
+        CASE
+          WHEN c.status IN ('up', 'down', 'maintenance') THEN 'known'
+          ELSE 'unknown'
+        END AS status
+      FROM check_results c
+      JOIN today_effective_start t ON t.monitor_id = c.monitor_id
+      WHERE t.needs_today = 1
+        AND t.effective_start IS NOT NULL
+        AND c.checked_at >= t.checks_start
+        AND c.checked_at < t.now_sec
+    ),
+    today_prev_check AS (
+      SELECT monitor_id, checked_at, status
+      FROM (
+        SELECT
+          c.monitor_id,
+          c.checked_at,
+          c.status,
+          ROW_NUMBER() OVER (
+            PARTITION BY c.monitor_id
+            ORDER BY c.checked_at DESC, c.check_id DESC
+          ) AS rn
+        FROM today_checks c
+        JOIN today_effective_start t ON t.monitor_id = c.monitor_id
+        WHERE c.checked_at < t.effective_start
+      )
+      WHERE rn = 1
+    ),
+    today_checks_after AS (
+      SELECT
+        c.monitor_id,
+        c.check_id,
+        c.checked_at,
+        c.status,
+        LEAD(c.checked_at) OVER (
+          PARTITION BY c.monitor_id
+          ORDER BY c.checked_at, c.check_id
+        ) AS next_checked_at
+      FROM today_checks c
+      JOIN today_effective_start t ON t.monitor_id = c.monitor_id
+      WHERE c.checked_at >= t.effective_start
+    ),
+    today_first_after AS (
+      SELECT
+        monitor_id,
+        MIN(checked_at) AS first_after_at
+      FROM today_checks_after
+      GROUP BY monitor_id
+    ),
+    today_start_segments AS (
+      SELECT
+        t.monitor_id,
+        t.interval_sec,
+        t.effective_start AS seg_start,
+        COALESCE(fa.first_after_at, t.now_sec) AS seg_end,
+        pc.checked_at AS last_check_at,
+        pc.status AS last_status
+      FROM today_effective_start t
+      LEFT JOIN today_prev_check pc ON pc.monitor_id = t.monitor_id
+      LEFT JOIN today_first_after fa ON fa.monitor_id = t.monitor_id
+      WHERE t.needs_today = 1
+        AND t.effective_start IS NOT NULL
+    ),
+    today_check_segments AS (
+      SELECT
+        ca.monitor_id,
+        t.interval_sec,
+        ca.checked_at AS seg_start,
+        COALESCE(ca.next_checked_at, t.now_sec) AS seg_end,
+        ca.checked_at AS last_check_at,
+        ca.status AS last_status
+      FROM today_checks_after ca
+      JOIN today_effective_start t ON t.monitor_id = ca.monitor_id
+      WHERE t.needs_today = 1
+        AND t.effective_start IS NOT NULL
+    ),
+    today_segments AS (
+      SELECT * FROM today_start_segments
+      UNION ALL
+      SELECT * FROM today_check_segments
+    ),
+    today_unknown_intervals AS (
+      SELECT
+        monitor_id,
+        CASE
+          WHEN seg_end <= seg_start THEN NULL
+          WHEN last_check_at IS NULL THEN seg_start
+          WHEN last_status = 'unknown' THEN seg_start
+          WHEN seg_start >= last_check_at + interval_sec * 2 THEN seg_start
+          WHEN seg_end > last_check_at + interval_sec * 2 THEN last_check_at + interval_sec * 2
+          ELSE NULL
+        END AS unknown_start,
+        seg_end AS unknown_end
+      FROM today_segments
+      WHERE seg_end > seg_start
+    ),
+    today_unknown_total AS (
+      SELECT
+        monitor_id,
+        SUM(unknown_end - unknown_start) AS unknown_sec
+      FROM today_unknown_intervals
+      WHERE unknown_start IS NOT NULL
+        AND unknown_end > unknown_start
+      GROUP BY monitor_id
+    ),
+    today_outage_intervals AS (
+      SELECT
+        o.monitor_id,
+        CASE
+          WHEN o.started_at > t.effective_start THEN o.started_at
+          ELSE t.effective_start
+        END AS start_at,
+        CASE
+          WHEN COALESCE(o.ended_at, t.now_sec) < t.now_sec THEN COALESCE(o.ended_at, t.now_sec)
+          ELSE t.now_sec
+        END AS end_at
+      FROM outages o
+      JOIN today_effective_start t ON t.monitor_id = o.monitor_id
+      WHERE t.needs_today = 1
+        AND t.effective_start IS NOT NULL
+        AND o.started_at < t.now_sec
+        AND (o.ended_at IS NULL OR o.ended_at > t.effective_start)
+    ),
+    today_downtime_total AS (
+      SELECT
+        monitor_id,
+        SUM(end_at - start_at) AS downtime_sec
+      FROM today_outage_intervals
+      WHERE end_at > start_at
+      GROUP BY monitor_id
+    ),
+    today_unknown_downtime_overlap AS (
+      SELECT
+        u.monitor_id,
+        SUM(
+          CASE
+            WHEN u.unknown_end <= d.start_at OR d.end_at <= u.unknown_start THEN 0
+            ELSE
+              (CASE WHEN u.unknown_end < d.end_at THEN u.unknown_end ELSE d.end_at END) -
+              (CASE WHEN u.unknown_start > d.start_at THEN u.unknown_start ELSE d.start_at END)
+          END
+        ) AS overlap_sec
+      FROM today_unknown_intervals u
+      JOIN today_outage_intervals d ON d.monitor_id = u.monitor_id
+      WHERE u.unknown_start IS NOT NULL
+        AND u.unknown_end > u.unknown_start
+        AND d.end_at > d.start_at
+      GROUP BY u.monitor_id
+    ),
+    today_totals_raw AS (
+      SELECT
+        t.monitor_id,
+        t.today_start AS day_start_at,
+        CASE
+          WHEN t.effective_start IS NULL OR t.now_sec <= t.effective_start THEN 0
+          ELSE t.now_sec - t.effective_start
+        END AS total_sec,
+        COALESCE(d.downtime_sec, 0) AS downtime_sec,
+        CASE
+          WHEN (COALESCE(u.unknown_sec, 0) - COALESCE(o.overlap_sec, 0)) > 0
+          THEN (COALESCE(u.unknown_sec, 0) - COALESCE(o.overlap_sec, 0))
+          ELSE 0
+        END AS unknown_sec
+      FROM today_effective_start t
+      LEFT JOIN today_downtime_total d ON d.monitor_id = t.monitor_id
+      LEFT JOIN today_unknown_total u ON u.monitor_id = t.monitor_id
+      LEFT JOIN today_unknown_downtime_overlap o ON o.monitor_id = t.monitor_id
+      WHERE t.needs_today = 1
+    ),
+    today_totals AS (
+      SELECT
+        monitor_id,
+        day_start_at,
+        downtime_sec,
+        unknown_sec,
+        CASE
+          WHEN total_sec <= 0 THEN NULL
+          ELSE CAST(
+            round(
+              (
+                CASE
+                  WHEN (downtime_sec + unknown_sec) >= total_sec THEN 0
+                  ELSE total_sec - (downtime_sec + unknown_sec)
+                END
+              ) * 100000.0 / total_sec
+            ) AS INTEGER
+          )
+        END AS uptime_pct_milli,
+        total_sec,
+        CASE
+          WHEN total_sec <= 0 THEN 0
+          WHEN (downtime_sec + unknown_sec) >= total_sec THEN 0
+          ELSE total_sec - (downtime_sec + unknown_sec)
+        END AS uptime_sec
+      FROM today_totals_raw
     ),
     rollup_rows AS (
       SELECT
@@ -971,8 +1267,18 @@ const HOMEPAGE_DATA_SNAPSHOT_SQL = `
       FROM monitor_daily_rollups r
       JOIN rollup_range rr
       WHERE r.monitor_id IN (SELECT id FROM presentation)
-        AND r.day_start_at >= rr.start_day_start
+        AND r.day_start_at >= rr.range_start_at
         AND r.day_start_at < rr.end_day_start
+      UNION ALL
+      SELECT
+        monitor_id,
+        day_start_at,
+        downtime_sec,
+        unknown_sec,
+        uptime_pct_milli,
+        total_sec,
+        uptime_sec
+      FROM today_totals
     ),
     rollup AS (
       SELECT
@@ -1082,7 +1388,7 @@ const HOMEPAGE_DATA_SNAPSHOT_SQL = `
           )
         )
       ORDER BY started_at DESC, id DESC
-      LIMIT 20
+      LIMIT 5
     ),
     active_incidents_json AS (
       SELECT json_group_array(
@@ -1130,7 +1436,7 @@ const HOMEPAGE_DATA_SNAPSHOT_SQL = `
           )
         )
       ORDER BY mw.starts_at ASC, mw.id ASC
-      LIMIT 20
+      LIMIT 3
     ),
     active_maintenance_json AS (
       SELECT json_group_array(
@@ -1177,7 +1483,7 @@ const HOMEPAGE_DATA_SNAPSHOT_SQL = `
           )
         )
       ORDER BY mw.starts_at ASC, mw.id ASC
-      LIMIT 20
+      LIMIT 5
     ),
     upcoming_maintenance_json AS (
       SELECT json_group_array(
