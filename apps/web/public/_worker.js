@@ -7,6 +7,31 @@ const TRACE_ID_HEADER = 'X-Uptimer-Trace-Id';
 const TRACE_TOKEN_HEADER = 'X-Uptimer-Trace-Token';
 const TRACE_MODE_HEADER = 'X-Uptimer-Trace-Mode';
 
+function isApiRequest(url) {
+  return url.pathname === '/api/v1' || url.pathname.startsWith('/api/v1/');
+}
+
+function resolveApiOrigin(env) {
+  const apiOrigin = typeof env?.UPTIMER_API_ORIGIN === 'string' ? env.UPTIMER_API_ORIGIN.trim() : '';
+  return apiOrigin || null;
+}
+
+function buildApiProxyUrl(url, env) {
+  const apiOrigin = resolveApiOrigin(env);
+  if (!apiOrigin) return null;
+  return new URL(`${url.pathname}${url.search}`, apiOrigin);
+}
+
+function jsonError(status, code, message) {
+  return new Response(JSON.stringify({ error: { code, message } }), {
+    status,
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store',
+    },
+  });
+}
+
 function acceptsHtml(request) {
   const accept = request.headers.get('Accept') || '';
   return accept.includes('text/html');
@@ -371,8 +396,8 @@ async function fetchIndexHtml(env, url) {
 }
 
 async function fetchPublicHomepageArtifact(env, trace) {
-  const apiOrigin = env.UPTIMER_API_ORIGIN;
-  if (typeof apiOrigin !== 'string' || apiOrigin.length === 0) return null;
+  const apiOrigin = resolveApiOrigin(env);
+  if (!apiOrigin) return null;
 
   const statusUrl = new URL('/api/v1/public/homepage-artifact', apiOrigin);
 
@@ -421,6 +446,42 @@ async function fetchPublicHomepageArtifact(env, trace) {
   }
 }
 
+async function proxyApiRequest(request, env, trace) {
+  const url = new URL(request.url);
+  const upstreamUrl = buildApiProxyUrl(url, env);
+
+  if (!upstreamUrl) {
+    if (trace) {
+      trace.setLabel('route', 'pages/api-proxy');
+      trace.setLabel('path', 'missing_origin');
+    }
+    return finalizeTraceResponse(
+      jsonError(
+        503,
+        'API_ORIGIN_NOT_CONFIGURED',
+        'Pages API proxy is not configured. Set UPTIMER_API_ORIGIN.',
+      ),
+      trace,
+    );
+  }
+
+  if (trace) {
+    trace.setLabel('route', 'pages/api-proxy');
+    trace.setLabel('path', url.pathname);
+  }
+
+  const upstreamRequest = new Request(upstreamUrl.toString(), request);
+  const upstreamResponse = trace
+    ? await trace.timeAsync('api_proxy_fetch', () => fetch(upstreamRequest))
+    : await fetch(upstreamRequest);
+
+  if (trace) {
+    trace.setLabel('api_status', upstreamResponse.status);
+  }
+
+  return finalizeTraceResponse(new Response(upstreamResponse.body, upstreamResponse), trace);
+}
+
 export default {
   async fetch(request, env, ctx) {
     try {
@@ -432,6 +493,10 @@ export default {
 
       const url = new URL(request.url);
       const trace = resolveTraceContext(request, env);
+
+      if (isApiRequest(url)) {
+        return proxyApiRequest(request, env, trace);
+      }
 
       // HTML requests: serve SPA entry for client-side routes.
       const wantsHtml = request.method === 'GET' && acceptsHtml(request);
