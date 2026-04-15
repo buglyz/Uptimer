@@ -234,6 +234,7 @@ const readRuntimeSnapshotStatementByDb = new WeakMap<D1Database, D1PreparedState
 const readRuntimeSnapshotMetadataStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
 const upsertRuntimeSnapshotStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
 const runtimeSnapshotCacheByDb = new WeakMap<D1Database, RuntimeSnapshotCacheEntry>();
+let runtimeSnapshotCacheGlobal: RuntimeSnapshotCacheGlobalEntry | null = null;
 
 type RuntimeSnapshotMetadataRow = {
   generated_at: number;
@@ -244,6 +245,10 @@ type RuntimeSnapshotCacheEntry = {
   generatedAt: number;
   updatedAt: number;
   snapshot: PublicMonitorRuntimeSnapshot;
+};
+
+type RuntimeSnapshotCacheGlobalEntry = RuntimeSnapshotCacheEntry & {
+  rawBodyJson: string;
 };
 
 function isFiniteNumber(value: unknown): value is number {
@@ -317,7 +322,8 @@ function readRuntimeSnapshotMetadataStatement(db: D1Database): D1PreparedStateme
 
 function upsertRuntimeSnapshotStatement(
   db: D1Database,
-  snapshot: PublicMonitorRuntimeSnapshot,
+  generatedAt: number,
+  bodyJson: string,
   now: number,
 ): D1PreparedStatement {
   const cached = upsertRuntimeSnapshotStatementByDb.get(db);
@@ -328,8 +334,8 @@ function upsertRuntimeSnapshotStatement(
 
   return statement.bind(
     MONITOR_RUNTIME_SNAPSHOT_KEY,
-    snapshot.generated_at,
-    JSON.stringify(snapshot),
+    generatedAt,
+    bodyJson,
     now,
   );
 }
@@ -369,6 +375,38 @@ function writeCachedRuntimeSnapshot(
   return snapshot;
 }
 
+function readCachedRuntimeSnapshotGlobal(
+  generatedAt: number,
+  updatedAt: number,
+  rawBodyJson: string,
+): PublicMonitorRuntimeSnapshot | null {
+  const cached = runtimeSnapshotCacheGlobal;
+  if (!cached) {
+    return null;
+  }
+
+  return cached.generatedAt === generatedAt &&
+    cached.updatedAt === updatedAt &&
+    cached.rawBodyJson === rawBodyJson
+    ? cached.snapshot
+    : null;
+}
+
+function writeCachedRuntimeSnapshotGlobal(
+  generatedAt: number,
+  updatedAt: number,
+  rawBodyJson: string,
+  snapshot: PublicMonitorRuntimeSnapshot,
+): PublicMonitorRuntimeSnapshot {
+  runtimeSnapshotCacheGlobal = {
+    generatedAt,
+    updatedAt,
+    rawBodyJson,
+    snapshot,
+  };
+  return snapshot;
+}
+
 async function readStoredMonitorRuntimeSnapshot(
   db: D1Database,
 ): Promise<{ generatedAt: number; snapshot: PublicMonitorRuntimeSnapshot } | null> {
@@ -393,6 +431,18 @@ async function readStoredMonitorRuntimeSnapshot(
     }>();
     if (!row?.body_json || row.generated_at !== metadata.generated_at) return null;
 
+    const globalCachedSnapshot = readCachedRuntimeSnapshotGlobal(
+      row.generated_at,
+      updatedAt,
+      row.body_json,
+    );
+    if (globalCachedSnapshot) {
+      return {
+        generatedAt: row.generated_at,
+        snapshot: writeCachedRuntimeSnapshot(db, row.generated_at, updatedAt, globalCachedSnapshot),
+      };
+    }
+
     const parsedJson = JSON.parse(row.body_json) as unknown;
     const parsed = publicMonitorRuntimeSnapshotSchema.safeParse(parsedJson);
     if (!parsed.success) {
@@ -402,7 +452,12 @@ async function readStoredMonitorRuntimeSnapshot(
 
     return {
       generatedAt: row.generated_at,
-      snapshot: writeCachedRuntimeSnapshot(db, row.generated_at, updatedAt, parsed.data),
+      snapshot: writeCachedRuntimeSnapshot(
+        db,
+        row.generated_at,
+        updatedAt,
+        writeCachedRuntimeSnapshotGlobal(row.generated_at, updatedAt, row.body_json, parsed.data),
+      ),
     };
   } catch (err) {
     if (
@@ -442,7 +497,10 @@ export async function writePublicMonitorRuntimeSnapshot(
   snapshot: PublicMonitorRuntimeSnapshot,
   now: number,
 ): Promise<void> {
-  await upsertRuntimeSnapshotStatement(db, snapshot, now).run();
+  const bodyJson = JSON.stringify(snapshot);
+  writeCachedRuntimeSnapshot(db, snapshot.generated_at, now, snapshot);
+  writeCachedRuntimeSnapshotGlobal(snapshot.generated_at, now, bodyJson, snapshot);
+  await upsertRuntimeSnapshotStatement(db, snapshot.generated_at, bodyJson, now).run();
 }
 
 export function snapshotHasMonitorIds(

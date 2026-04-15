@@ -241,7 +241,7 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
         : import('./snapshots/public-homepage'),
     ]);
     const fastComputed =
-      skipInitialFreshnessCheck && baseSnapshot.bodyJson
+      skipInitialFreshnessCheck && baseSnapshot.snapshot
         ? trace
           ? await trace.timeAsync(
               'homepage_refresh_fast_compute',
@@ -249,7 +249,8 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
                 await homepageMod.tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates({
                   db: env.DB,
                   now,
-                  baseSnapshotBodyJson: baseSnapshot.bodyJson,
+                  baseSnapshot: baseSnapshot.snapshot,
+                  baseSnapshotBodyJson: null,
                   updates: runtimeUpdates ?? [],
                   trace,
                 }),
@@ -257,7 +258,8 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
           : await homepageMod.tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates({
               db: env.DB,
               now,
-              baseSnapshotBodyJson: baseSnapshot.bodyJson,
+              baseSnapshot: baseSnapshot.snapshot,
+              baseSnapshotBodyJson: null,
               updates: runtimeUpdates ?? [],
             })
         : null;
@@ -272,11 +274,13 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
             async () =>
               await homepageMod.computePublicHomepagePayload(env.DB, now, {
                 trace,
-                baseSnapshotBodyJson: baseSnapshot.bodyJson,
+                baseSnapshot: baseSnapshot.snapshot,
+                baseSnapshotBodyJson: null,
               }),
           )
         : await homepageMod.computePublicHomepagePayload(env.DB, now, {
-            baseSnapshotBodyJson: baseSnapshot.bodyJson,
+            baseSnapshot: baseSnapshot.snapshot,
+            baseSnapshotBodyJson: null,
           });
     const payload = trace
       ? trace.time('homepage_refresh_validate', () =>

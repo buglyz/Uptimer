@@ -2,6 +2,7 @@ import { AppError } from '../middleware/errors';
 import {
   publicHomepageRenderArtifactSchema,
   publicHomepageResponseSchema,
+  type PublicHomepageResponse,
 } from '../schemas/public-homepage';
 
 const SNAPSHOT_KEY = 'homepage';
@@ -28,6 +29,11 @@ const normalizedHomepageArtifactCacheByDb = new WeakMap<
 >();
 const normalizedHomepagePayloadCacheGlobal = new Map<SnapshotKey, RawNormalizedSnapshotRow>();
 const normalizedHomepageArtifactCacheGlobal = new Map<SnapshotKey, RawNormalizedSnapshotRow>();
+const parsedHomepagePayloadCacheByDb = new WeakMap<
+  D1Database,
+  Map<SnapshotKey, ParsedSnapshotRow>
+>();
+const parsedHomepagePayloadCacheGlobal = new Map<SnapshotKey, RawParsedSnapshotRow>();
 
 type SnapshotRefreshRow = {
   key: SnapshotKey;
@@ -49,6 +55,16 @@ type NormalizedSnapshotRow = {
 };
 
 type RawNormalizedSnapshotRow = NormalizedSnapshotRow & {
+  rawBodyJson: string;
+};
+
+type ParsedSnapshotRow = {
+  generatedAt: number;
+  updatedAt: number;
+  snapshot: PublicHomepageResponse;
+};
+
+type RawParsedSnapshotRow = ParsedSnapshotRow & {
   rawBodyJson: string;
 };
 
@@ -83,9 +99,17 @@ function normalizeDirectHomepagePayload(
   value: unknown,
   rawBodyJson: string | null,
 ): string | null {
+  const parsedPayload = parseDirectHomepagePayload(value);
+  if (parsedPayload) {
+    return rawBodyJson ?? JSON.stringify(parsedPayload);
+  }
+  return null;
+}
+
+function parseDirectHomepagePayload(value: unknown): PublicHomepageResponse | null {
   const directPayload = publicHomepageResponseSchema.safeParse(value);
   if (directPayload.success) {
-    return rawBodyJson ?? JSON.stringify(directPayload.data);
+    return directPayload.data;
   }
   if (!isRecord(value)) {
     return null;
@@ -99,7 +123,7 @@ function normalizeDirectHomepagePayload(
         : 'full',
     monitor_count_total: Array.isArray(value.monitors) ? value.monitors.length : 0,
   });
-  return normalizedPayload.success ? JSON.stringify(normalizedPayload.data) : null;
+  return normalizedPayload.success ? normalizedPayload.data : null;
 }
 
 function normalizeHomepagePayloadBodyJsonForKey(
@@ -154,6 +178,36 @@ function normalizeHomepageArtifactBodyJson(bodyJson: string): string | null {
   return legacyArtifact.success ? JSON.stringify(legacyArtifact.data) : null;
 }
 
+function parseHomepagePayloadSnapshotForKey(
+  key: SnapshotKey,
+  bodyJson: string,
+): PublicHomepageResponse | null {
+  const parsed = parseJsonText(bodyJson);
+  if (parsed === null) return null;
+  if (!isRecord(parsed.value)) {
+    return null;
+  }
+
+  const version = parsed.value.version;
+  if (version === SPLIT_SNAPSHOT_VERSION || version === LEGACY_COMBINED_SNAPSHOT_VERSION) {
+    return parseDirectHomepagePayload(parsed.value.data);
+  }
+
+  if (key === SNAPSHOT_KEY) {
+    const directPayload = parseDirectHomepagePayload(parsed.value);
+    if (directPayload) {
+      return directPayload;
+    }
+  }
+
+  const artifact = publicHomepageRenderArtifactSchema.safeParse(parsed.value);
+  if (artifact.success) {
+    return artifact.data.snapshot;
+  }
+
+  return key === SNAPSHOT_KEY ? null : parseDirectHomepagePayload(parsed.value);
+}
+
 function toSnapshotUpdatedAt(row: Pick<SnapshotRefreshRow, 'generated_at' | 'updated_at'>): number {
   return typeof row.updated_at === 'number' && Number.isFinite(row.updated_at)
     ? row.updated_at
@@ -170,6 +224,20 @@ function getNormalizedSnapshotCache(
   }
 
   const next = new Map<SnapshotKey, NormalizedSnapshotRow>();
+  cacheByDb.set(db, next);
+  return next;
+}
+
+function getParsedSnapshotCache(
+  cacheByDb: WeakMap<D1Database, Map<SnapshotKey, ParsedSnapshotRow>>,
+  db: D1Database,
+): Map<SnapshotKey, ParsedSnapshotRow> {
+  const cached = cacheByDb.get(db);
+  if (cached) {
+    return cached;
+  }
+
+  const next = new Map<SnapshotKey, ParsedSnapshotRow>();
   cacheByDb.set(db, next);
   return next;
 }
@@ -205,6 +273,37 @@ function writeCachedNormalizedSnapshotRow(
   return row;
 }
 
+function readCachedParsedSnapshotRow(
+  cacheByDb: WeakMap<D1Database, Map<SnapshotKey, ParsedSnapshotRow>>,
+  db: D1Database,
+  candidate: SnapshotCandidate,
+): ParsedSnapshotRow | null {
+  const cache = getParsedSnapshotCache(cacheByDb, db);
+  const row = cache.get(candidate.key);
+  if (!row) {
+    return null;
+  }
+
+  return row.generatedAt === candidate.generatedAt && row.updatedAt === candidate.updatedAt
+    ? row
+    : null;
+}
+
+function writeCachedParsedSnapshotRow(
+  cacheByDb: WeakMap<D1Database, Map<SnapshotKey, ParsedSnapshotRow>>,
+  db: D1Database,
+  candidate: SnapshotCandidate,
+  snapshot: PublicHomepageResponse,
+): ParsedSnapshotRow {
+  const row: ParsedSnapshotRow = {
+    generatedAt: candidate.generatedAt,
+    updatedAt: candidate.updatedAt,
+    snapshot,
+  };
+  getParsedSnapshotCache(cacheByDb, db).set(candidate.key, row);
+  return row;
+}
+
 function readCachedNormalizedSnapshotRowGlobal(
   cache: ReadonlyMap<SnapshotKey, RawNormalizedSnapshotRow>,
   candidate: SnapshotCandidate,
@@ -233,6 +332,39 @@ function writeCachedNormalizedSnapshotRowGlobal(
     updatedAt: candidate.updatedAt,
     rawBodyJson,
     bodyJson,
+  };
+  cache.set(candidate.key, row);
+  return row;
+}
+
+function readCachedParsedSnapshotRowGlobal(
+  cache: ReadonlyMap<SnapshotKey, RawParsedSnapshotRow>,
+  candidate: SnapshotCandidate,
+  rawBodyJson: string,
+): ParsedSnapshotRow | null {
+  const row = cache.get(candidate.key);
+  if (!row) {
+    return null;
+  }
+
+  return row.generatedAt === candidate.generatedAt &&
+    row.updatedAt === candidate.updatedAt &&
+    row.rawBodyJson === rawBodyJson
+    ? row
+    : null;
+}
+
+function writeCachedParsedSnapshotRowGlobal(
+  cache: Map<SnapshotKey, RawParsedSnapshotRow>,
+  candidate: SnapshotCandidate,
+  rawBodyJson: string,
+  snapshot: PublicHomepageResponse,
+): RawParsedSnapshotRow {
+  const row: RawParsedSnapshotRow = {
+    generatedAt: candidate.generatedAt,
+    updatedAt: candidate.updatedAt,
+    rawBodyJson,
+    snapshot,
   };
   cache.set(candidate.key, row);
   return row;
@@ -426,7 +558,7 @@ export async function readHomepageRefreshBaseSnapshot(
   now: number,
 ): Promise<{
   generatedAt: number | null;
-  bodyJson: string | null;
+  snapshot: PublicHomepageResponse | null;
   seedDataSnapshot: boolean;
 }> {
   const refreshRows = await readRefreshSnapshotRows(db);
@@ -440,7 +572,7 @@ export async function readHomepageRefreshBaseSnapshot(
   const rowByKey = new Map(refreshRows.map((row) => [row.key, row]));
   const readRefreshCandidate = async (
     candidateList: readonly SnapshotCandidate[],
-  ): Promise<{ row: NormalizedSnapshotRow | null; invalid: boolean }> => {
+  ): Promise<{ row: ParsedSnapshotRow | null; invalid: boolean }> => {
     let invalid = false;
 
     for (const candidate of candidateList) {
@@ -449,8 +581,8 @@ export async function readHomepageRefreshBaseSnapshot(
         continue;
       }
 
-      const dbCached = readCachedNormalizedSnapshotRow(
-        normalizedHomepagePayloadCacheByDb,
+      const dbCached = readCachedParsedSnapshotRow(
+        parsedHomepagePayloadCacheByDb,
         db,
         candidate,
       );
@@ -458,42 +590,42 @@ export async function readHomepageRefreshBaseSnapshot(
         return { row: dbCached, invalid };
       }
 
-      const globalCached = readCachedNormalizedSnapshotRowGlobal(
-        normalizedHomepagePayloadCacheGlobal,
+      const globalCached = readCachedParsedSnapshotRowGlobal(
+        parsedHomepagePayloadCacheGlobal,
         candidate,
         row.body_json,
       );
       if (globalCached) {
         return {
-          row: writeCachedNormalizedSnapshotRow(
-            normalizedHomepagePayloadCacheByDb,
+          row: writeCachedParsedSnapshotRow(
+            parsedHomepagePayloadCacheByDb,
             db,
             candidate,
-            globalCached.bodyJson,
+            globalCached.snapshot,
           ),
           invalid,
         };
       }
 
-      const bodyJson = normalizeHomepagePayloadBodyJsonForKey(candidate.key, row.body_json);
-      if (!bodyJson) {
+      const snapshot = parseHomepagePayloadSnapshotForKey(candidate.key, row.body_json);
+      if (!snapshot) {
         invalid = true;
         continue;
       }
 
-      writeCachedNormalizedSnapshotRowGlobal(
-        normalizedHomepagePayloadCacheGlobal,
+      writeCachedParsedSnapshotRowGlobal(
+        parsedHomepagePayloadCacheGlobal,
         candidate,
         row.body_json,
-        bodyJson,
+        snapshot,
       );
 
       return {
-        row: writeCachedNormalizedSnapshotRow(
-          normalizedHomepagePayloadCacheByDb,
+        row: writeCachedParsedSnapshotRow(
+          parsedHomepagePayloadCacheByDb,
           db,
           candidate,
-          bodyJson,
+          snapshot,
         ),
         invalid,
       };
@@ -508,7 +640,7 @@ export async function readHomepageRefreshBaseSnapshot(
   if (sameDayBase) {
     return {
       generatedAt: sameDayBase.generatedAt,
-      bodyJson: sameDayBase.bodyJson,
+      snapshot: sameDayBase.snapshot,
       seedDataSnapshot: false,
     };
   }
@@ -517,7 +649,7 @@ export async function readHomepageRefreshBaseSnapshot(
   if (freshestBase) {
     return {
       generatedAt: freshestBase.generatedAt,
-      bodyJson: freshestBase.bodyJson,
+      snapshot: freshestBase.snapshot,
       seedDataSnapshot: true,
     };
   }
@@ -525,7 +657,7 @@ export async function readHomepageRefreshBaseSnapshot(
   if (candidates.length === 0) {
     return {
       generatedAt: null,
-      bodyJson: null,
+      snapshot: null,
       seedDataSnapshot: true,
     };
   }
@@ -536,7 +668,7 @@ export async function readHomepageRefreshBaseSnapshot(
 
   return {
     generatedAt: null,
-    bodyJson: null,
+    snapshot: null,
     seedDataSnapshot: true,
   };
 }

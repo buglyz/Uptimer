@@ -493,7 +493,7 @@ describe('snapshots/public-homepage', () => {
 
     await expect(readHomepageRefreshBaseSnapshot(db, now)).resolves.toEqual({
       generatedAt: artifactPayload.generated_at,
-      bodyJson: JSON.stringify(artifactPayload),
+      snapshot: artifactPayload,
       seedDataSnapshot: false,
     });
   });

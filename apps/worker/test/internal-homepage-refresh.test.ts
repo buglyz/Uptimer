@@ -182,6 +182,23 @@ describe('internal homepage refresh route', () => {
     expect(tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates).toHaveBeenCalledTimes(1);
     expect(computePublicHomepagePayload).not.toHaveBeenCalled();
     expect(writeHomepageSnapshot).toHaveBeenCalledWith(env.DB, now, fastPayload, undefined, false);
+    expect(vi.mocked(tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates)).toHaveBeenCalledWith({
+      db: env.DB,
+      now,
+      baseSnapshot,
+      baseSnapshotBodyJson: null,
+      updates: [
+        {
+          monitor_id: 1,
+          interval_sec: 60,
+          created_at: now - 300,
+          checked_at: now,
+          check_status: 'up',
+          next_status: 'up',
+          latency_ms: 55,
+        },
+      ],
+    });
   });
 
   it('falls back to full compute when the scheduled runtime fast path misses', async () => {
@@ -217,7 +234,8 @@ describe('internal homepage refresh route', () => {
     expect(res.status).toBe(200);
     expect(tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates).toHaveBeenCalledTimes(1);
     expect(computePublicHomepagePayload).toHaveBeenCalledWith(env.DB, now, {
-      baseSnapshotBodyJson: JSON.stringify(baseSnapshot),
+      baseSnapshot,
+      baseSnapshotBodyJson: null,
     });
   });
 });

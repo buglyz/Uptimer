@@ -99,6 +99,7 @@ type HomepageMonitorDataOptions = {
   maintenanceMonitorIdsPromise?: Promise<ReadonlySet<number>>;
   baseSnapshot?: PublicHomepageResponse | null;
   runtimeSnapshot?: PublicMonitorRuntimeSnapshot | null;
+  monitorMetadataStamp?: HomepageMonitorMetadataStamp | null;
   trustBaseSnapshotMonitorMetadata?: boolean;
   trace?: Trace;
 };
@@ -1048,7 +1049,9 @@ async function buildHomepageMonitorData(
             async () => await readPublicMonitorRuntimeSnapshot(db, now),
           );
   const monitorMetadataStampPromise =
-    baseSnapshot === null || opts.trustBaseSnapshotMonitorMetadata
+    opts.monitorMetadataStamp !== undefined
+      ? Promise.resolve(opts.monitorMetadataStamp)
+      : baseSnapshot === null || opts.trustBaseSnapshotMonitorMetadata
       ? Promise.resolve<HomepageMonitorMetadataStamp | null>(null)
       : withTraceAsync(
           trace,
@@ -1767,11 +1770,12 @@ async function readHomepageScheduledFastGuardState(
 export async function tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates(opts: {
   db: D1Database;
   now: number;
+  baseSnapshot?: PublicHomepageResponse | null;
   baseSnapshotBodyJson: string | null | undefined;
   updates: MonitorRuntimeUpdate[];
   trace?: Trace;
 }): Promise<PublicHomepageResponse | null> {
-  const baseSnapshot = parseHomepageSnapshotBodyJson(opts.baseSnapshotBodyJson);
+  const baseSnapshot = opts.baseSnapshot ?? parseHomepageSnapshotBodyJson(opts.baseSnapshotBodyJson);
   if (!baseSnapshot || !canReuseStaticHomepageSections(baseSnapshot)) {
     return null;
   }
@@ -1828,6 +1832,7 @@ export async function tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates
       maintenanceMonitorIdsPromise: Promise.resolve(new Set<number>()),
       baseSnapshot,
       runtimeSnapshot,
+      monitorMetadataStamp: guardState.monitorMetadataStamp,
       ...(opts.trace ? { trace: opts.trace } : {}),
     }),
   );
@@ -1865,14 +1870,16 @@ export async function computePublicHomepagePayload(
   now: number,
   opts: {
     trace?: Trace;
+    baseSnapshot?: PublicHomepageResponse | null;
     baseSnapshotBodyJson?: string | null;
     runtimeSnapshot?: PublicMonitorRuntimeSnapshot | null;
+    monitorMetadataStamp?: HomepageMonitorMetadataStamp | null;
     trustBaseSnapshotMonitorMetadata?: boolean;
   } = {},
 ): Promise<PublicHomepageResponse> {
   const trace = opts.trace;
   const includeHiddenMonitors = false;
-  const baseSnapshot = parseHomepageSnapshotBodyJson(opts.baseSnapshotBodyJson);
+  const baseSnapshot = opts.baseSnapshot ?? parseHomepageSnapshotBodyJson(opts.baseSnapshotBodyJson);
   const settingsPromise = withTraceAsync(trace, 'homepage_settings', async () =>
     await readPublicSiteSettings(db),
   );
@@ -1896,6 +1903,9 @@ export async function computePublicHomepagePayload(
                 collectMaintenanceMonitorIds(resolvedMaintenance.active),
               ),
               baseSnapshot,
+              ...(opts.monitorMetadataStamp !== undefined
+                ? { monitorMetadataStamp: opts.monitorMetadataStamp }
+                : {}),
               ...(opts.runtimeSnapshot !== undefined
                 ? { runtimeSnapshot: opts.runtimeSnapshot }
                 : {}),

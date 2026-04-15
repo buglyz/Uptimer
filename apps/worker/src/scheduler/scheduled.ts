@@ -60,7 +60,8 @@ async function refreshHomepageSnapshotInline(
     now,
     compute: () =>
       computePublicHomepagePayload(env.DB, now, {
-        baseSnapshotBodyJson: baseSnapshot.bodyJson,
+        baseSnapshot: baseSnapshot.snapshot,
+        baseSnapshotBodyJson: null,
       }),
     seedDataSnapshot: baseSnapshot.seedDataSnapshot,
   });
