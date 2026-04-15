@@ -695,10 +695,12 @@ export async function readHomepageRefreshBaseSnapshot(
   snapshot: PublicHomepageResponse | null;
   seedDataSnapshot: boolean;
 }> {
+  const refreshRows = await readRefreshSnapshotRows(db);
+  const rowByKey = new Map(refreshRows.map((row) => [row.key, row]));
   let invalid = false;
 
-  const readRefreshCandidate = async (key: SnapshotKey): Promise<ParsedSnapshotRow | null> => {
-    const row = await readRefreshSnapshotRowByKey(db, key);
+  const readRefreshCandidate = (key: SnapshotKey): ParsedSnapshotRow | null => {
+    const row = rowByKey.get(key);
     if (!row?.body_json) {
       return null;
     }
@@ -759,10 +761,8 @@ export async function readHomepageRefreshBaseSnapshot(
     );
   };
 
-  const [homepageBase, artifactBase] = await Promise.all([
-    readRefreshCandidate(SNAPSHOT_KEY),
-    readRefreshCandidate(SNAPSHOT_ARTIFACT_KEY),
-  ]);
+  const homepageBase = readRefreshCandidate(SNAPSHOT_KEY);
+  const artifactBase = readRefreshCandidate(SNAPSHOT_ARTIFACT_KEY);
 
   let sameDayBase: ParsedSnapshotRow | null =
     homepageBase && isSameUtcDay(homepageBase.generatedAt, now) ? homepageBase : null;

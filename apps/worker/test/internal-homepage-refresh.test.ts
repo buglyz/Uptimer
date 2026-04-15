@@ -84,39 +84,15 @@ function createEnv(now: number): Env {
   return {
     DB: createFakeD1Database([
       {
-        match: 'select key, generated_at, updated_at from public_snapshots',
+        match: 'select key, generated_at, updated_at, body_json from public_snapshots',
         all: () => [
           {
             key: 'homepage',
             generated_at: baseSnapshot.generated_at,
             updated_at: baseSnapshot.generated_at,
+            body_json: JSON.stringify(baseSnapshot),
           },
         ],
-      },
-      {
-        match: 'select generated_at, updated_at from public_snapshots',
-        first: (args) => {
-          if (args[0] === 'homepage') {
-            return {
-              generated_at: baseSnapshot.generated_at,
-              updated_at: baseSnapshot.generated_at,
-            };
-          }
-          return null;
-        },
-      },
-      {
-        match: 'select generated_at, updated_at, body_json from public_snapshots',
-        first: (args) => {
-          if (args[0] === 'homepage') {
-            return {
-              generated_at: baseSnapshot.generated_at,
-              updated_at: baseSnapshot.generated_at,
-              body_json: JSON.stringify(baseSnapshot),
-            };
-          }
-          return null;
-        },
       },
     ]),
     ADMIN_TOKEN: 'test-admin-token',
