@@ -79,6 +79,7 @@ type HomepageMonitorDataOptions = {
   cardLimit?: number;
   uptimeRatingLevel?: 1 | 2 | 3 | 4 | 5;
   maintenanceMonitorIdsPromise?: Promise<ReadonlySet<number>>;
+  baseSnapshot?: PublicHomepageResponse | null;
   trace?: Trace;
 };
 
@@ -325,6 +326,74 @@ function addUptimeDay(
   totals.uptimeSec += uptime.uptime_sec;
 }
 
+function historicalDayTotalSeconds(opts: {
+  dayStartAt: number;
+  rangeStart: number;
+  rangeEndFullDays: number;
+  monitorCreatedAt: number;
+}): number {
+  const dayStart = Math.max(opts.dayStartAt, opts.rangeStart, opts.monitorCreatedAt);
+  const dayEnd = Math.min(opts.dayStartAt + 86_400, opts.rangeEndFullDays);
+  return Math.max(0, dayEnd - dayStart);
+}
+
+function reuseHistoricalRollupsFromBase(opts: {
+  monitor: HomepageMonitorCard;
+  baseMonitor: HomepageMonitorCard;
+  monitorCreatedAt: number;
+  rangeStart: number;
+  rangeEndFullDays: number;
+  todayStartAt: number;
+  totals: { totalSec: number; uptimeSec: number };
+}): void {
+  const dayStartAt: number[] = [];
+  const downtimeSec: number[] = [];
+  const unknownSec: number[] = [];
+  const uptimePctMilli: Array<number | null> = [];
+
+  const count = Math.min(
+    opts.baseMonitor.uptime_day_strip.day_start_at.length,
+    opts.baseMonitor.uptime_day_strip.downtime_sec.length,
+    opts.baseMonitor.uptime_day_strip.unknown_sec.length,
+    opts.baseMonitor.uptime_day_strip.uptime_pct_milli.length,
+  );
+
+  for (let index = 0; index < count; index += 1) {
+    const day = opts.baseMonitor.uptime_day_strip.day_start_at[index];
+    if (typeof day !== 'number' || day >= opts.todayStartAt || day < opts.rangeStart) {
+      continue;
+    }
+
+    const downtime = Math.max(
+      0,
+      opts.baseMonitor.uptime_day_strip.downtime_sec[index] ?? 0,
+    );
+    const unknown = Math.max(
+      0,
+      opts.baseMonitor.uptime_day_strip.unknown_sec[index] ?? 0,
+    );
+
+    dayStartAt.push(day);
+    downtimeSec.push(downtime);
+    unknownSec.push(unknown);
+    uptimePctMilli.push(opts.baseMonitor.uptime_day_strip.uptime_pct_milli[index] ?? null);
+
+    const totalSec = historicalDayTotalSeconds({
+      dayStartAt: day,
+      rangeStart: opts.rangeStart,
+      rangeEndFullDays: opts.rangeEndFullDays,
+      monitorCreatedAt: opts.monitorCreatedAt,
+    });
+    opts.totals.totalSec += totalSec;
+    opts.totals.uptimeSec += Math.max(0, totalSec - downtime - unknown);
+  }
+
+  opts.monitor.uptime_day_strip.day_start_at = dayStartAt;
+  opts.monitor.uptime_day_strip.downtime_sec = downtimeSec;
+  opts.monitor.uptime_day_strip.unknown_sec = unknownSec;
+  opts.monitor.uptime_day_strip.uptime_pct_milli = uptimePctMilli;
+}
+
 async function listHomepageMonitorRows(
   db: D1Database,
   includeHiddenMonitors: boolean,
@@ -488,6 +557,7 @@ async function buildHomepageMonitorCardsFromRows(
   now: number,
   rows: HomepageMonitorRow[],
   maintenanceMonitorIds: ReadonlySet<number>,
+  baseSnapshot: PublicHomepageResponse | null | undefined,
   trace?: Trace,
 ): Promise<HomepageMonitorCard[]> {
   if (rows.length === 0) {
@@ -510,6 +580,9 @@ async function buildHomepageMonitorCardsFromRows(
   // This avoids missing uptime strips / 30d uptime immediately after a fresh deployment.
   const needsToday = rangeEnd > rangeEndFullDays;
   const monitors = rows.map((row) => toHomepageMonitorCard(row, now, maintenanceMonitorIds));
+  const baseMonitorsById = baseSnapshot
+    ? new Map(baseSnapshot.monitors.map((monitor) => [monitor.id, monitor]))
+    : null;
   const runtimeSnapshot = await withTraceAsync(
     trace,
     'homepage_cards_runtime_cache_read',
@@ -561,42 +634,46 @@ async function buildHomepageMonitorCardsFromRows(
         },
       );
 
-  const rollupRowsPromise = withTraceAsync(
-    trace,
-    'homepage_cards_rollup_query',
-    async () =>
-      await db
-        .prepare(
-          `
-      SELECT
-        monitor_id,
-        json_group_array(day_start_at) AS day_start_at_json,
-        json_group_array(downtime_sec) AS downtime_sec_json,
-        json_group_array(unknown_sec) AS unknown_sec_json,
-        json_group_array(
-          CASE
-            WHEN total_sec IS NULL OR total_sec = 0 THEN NULL
-            ELSE CAST(round((uptime_sec * 100000.0) / total_sec) AS INTEGER)
-          END
-        ) AS uptime_pct_milli_json,
-        sum(total_sec) AS total_sec_sum,
-        sum(uptime_sec) AS uptime_sec_sum
-      FROM (
-        SELECT monitor_id, day_start_at, total_sec, downtime_sec, unknown_sec, uptime_sec
-        FROM monitor_daily_rollups
-        WHERE monitor_id IN (${placeholders})
-          AND day_start_at >= ?${selectedIds.length + 1}
-          AND day_start_at < ?${selectedIds.length + 2}
-        ORDER BY monitor_id, day_start_at
-      )
-      GROUP BY monitor_id
-      ORDER BY monitor_id
-    `,
+  const canReuseHistoricalRollups =
+    baseMonitorsById !== null && selectedIds.every((id) => baseMonitorsById.has(id));
+  const rollupRowsPromise = canReuseHistoricalRollups
+    ? Promise.resolve<HomepageUptimeDayStripAggRawRow[]>([])
+    : withTraceAsync(
+        trace,
+        'homepage_cards_rollup_query',
+        async () =>
+          await db
+            .prepare(
+              `
+        SELECT
+          monitor_id,
+          json_group_array(day_start_at) AS day_start_at_json,
+          json_group_array(downtime_sec) AS downtime_sec_json,
+          json_group_array(unknown_sec) AS unknown_sec_json,
+          json_group_array(
+            CASE
+              WHEN total_sec IS NULL OR total_sec = 0 THEN NULL
+              ELSE CAST(round((uptime_sec * 100000.0) / total_sec) AS INTEGER)
+            END
+          ) AS uptime_pct_milli_json,
+          sum(total_sec) AS total_sec_sum,
+          sum(uptime_sec) AS uptime_sec_sum
+        FROM (
+          SELECT monitor_id, day_start_at, total_sec, downtime_sec, unknown_sec, uptime_sec
+          FROM monitor_daily_rollups
+          WHERE monitor_id IN (${placeholders})
+            AND day_start_at >= ?${selectedIds.length + 1}
+            AND day_start_at < ?${selectedIds.length + 2}
+          ORDER BY monitor_id, day_start_at
         )
-        .bind(...selectedIds, rangeStart, rangeEndFullDays)
-        .raw<HomepageUptimeDayStripAggRawRow>()
-        .then((resultRows) => resultRows ?? []),
-  );
+        GROUP BY monitor_id
+        ORDER BY monitor_id
+      `,
+            )
+            .bind(...selectedIds, rangeStart, rangeEndFullDays)
+            .raw<HomepageUptimeDayStripAggRawRow>()
+            .then((resultRows) => resultRows ?? []),
+      );
 
   const todayByMonitorIdPromise: Promise<Map<number, UptimeWindowTotals>> = !needsToday
     ? Promise.resolve(new Map<number, UptimeWindowTotals>())
@@ -653,6 +730,29 @@ async function buildHomepageMonitorCardsFromRows(
     uptimeSec: 0,
   }));
   withTraceSync(trace, 'homepage_cards_rollup_hydrate', () => {
+    if (canReuseHistoricalRollups && baseMonitorsById) {
+      for (let index = 0; index < rows.length; index += 1) {
+        const row = rows[index];
+        const monitor = monitors[index];
+        const totals = totalsByMonitor[index];
+        if (!row || !monitor || !totals) continue;
+
+        const baseMonitor = baseMonitorsById.get(row.id);
+        if (!baseMonitor) continue;
+
+        reuseHistoricalRollupsFromBase({
+          monitor,
+          baseMonitor,
+          monitorCreatedAt: row.created_at,
+          rangeStart,
+          rangeEndFullDays,
+          todayStartAt,
+          totals,
+        });
+      }
+      return;
+    }
+
     for (const row of rollupRows) {
       const index = monitorIndexById.get(row[0]);
       if (index === undefined) continue;
@@ -780,7 +880,14 @@ async function buildHomepageMonitorData(
     trace,
     'homepage_monitor_cards',
     async () =>
-      await buildHomepageMonitorCardsFromRows(db, now, selectedRows, maintenanceMonitorIds, trace),
+      await buildHomepageMonitorCardsFromRows(
+        db,
+        now,
+        selectedRows,
+        maintenanceMonitorIds,
+        opts.baseSnapshot,
+        trace,
+      ),
   );
 
   return {
@@ -1063,6 +1170,7 @@ export async function computePublicHomepagePayload(
               maintenanceMonitorIdsPromise: maintenanceWindowsPromise.then((resolvedMaintenance) =>
                 collectMaintenanceMonitorIds(resolvedMaintenance.active),
               ),
+              baseSnapshot,
               ...(trace ? { trace } : {}),
             }),
           ),
@@ -1182,6 +1290,7 @@ export async function computePublicHomepageArtifactPayload(
     now,
     bootstrapRows,
     maintenanceMonitorIds,
+    undefined,
   );
 
   return {

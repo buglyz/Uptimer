@@ -197,4 +197,108 @@ describe('computePublicHomepagePayload', () => {
       uptime_pct_milli: [100_000],
     });
   });
+
+  it('reuses historical uptime strips from the base snapshot without querying rollups', async () => {
+    const now = 1_728_000_000;
+    const previousDay = now - 86_400;
+
+    const baseSnapshot = {
+      generated_at: now - 60,
+      bootstrap_mode: 'full' as const,
+      monitor_count_total: 1,
+      site_title: 'Status Hub',
+      site_description: 'Production services',
+      site_locale: 'en' as const,
+      site_timezone: 'UTC',
+      uptime_rating_level: 4 as const,
+      overall_status: 'up' as const,
+      banner: {
+        source: 'monitors' as const,
+        status: 'operational' as const,
+        title: 'All Systems Operational',
+      },
+      summary: {
+        up: 1,
+        down: 0,
+        maintenance: 0,
+        paused: 0,
+        unknown: 0,
+      },
+      monitors: [
+        {
+          id: 1,
+          name: 'API',
+          type: 'http' as const,
+          group_name: 'Core',
+          status: 'up' as const,
+          is_stale: false,
+          last_checked_at: previousDay + 60,
+          heartbeat_strip: {
+            checked_at: [previousDay + 60],
+            status_codes: 'u',
+            latency_ms: [42],
+          },
+          uptime_30d: { uptime_pct: 100 },
+          uptime_day_strip: {
+            day_start_at: [previousDay],
+            downtime_sec: [0],
+            unknown_sec: [0],
+            uptime_pct_milli: [100_000],
+          },
+        },
+      ],
+      active_incidents: [],
+      maintenance_windows: {
+        active: [],
+        upcoming: [],
+      },
+      resolved_incident_preview: null,
+      maintenance_history_preview: null,
+    };
+
+    const handlers: FakeD1QueryHandler[] = [
+      {
+        match: 'from monitors m',
+        all: () => [
+          {
+            id: 1,
+            name: 'API',
+            type: 'http',
+            group_name: 'Core',
+            group_sort_order: 0,
+            sort_order: 0,
+            interval_sec: 60,
+            created_at: now - 40 * 86_400,
+            state_status: 'up',
+            last_checked_at: previousDay + 60,
+          },
+        ],
+      },
+      {
+        match: 'select distinct mwm.monitor_id',
+        all: () => [],
+      },
+      {
+        match: 'select checked_at, latency_ms, status from check_results',
+        all: () => [{ checked_at: previousDay + 60, latency_ms: 42, status: 'up' }],
+      },
+      {
+        match: (sql) => sql.startsWith('select key, value from settings'),
+        all: () => [
+          { key: 'site_title', value: 'Status Hub' },
+          { key: 'site_description', value: 'Production services' },
+          { key: 'site_locale', value: 'en' },
+          { key: 'site_timezone', value: 'UTC' },
+          { key: 'uptime_rating_level', value: '4' },
+        ],
+      },
+    ];
+
+    const payload = await computePublicHomepagePayload(createFakeD1Database(handlers), now, {
+      baseSnapshotBodyJson: JSON.stringify(baseSnapshot),
+    });
+
+    expect(payload.monitors[0]?.uptime_day_strip).toEqual(baseSnapshot.monitors[0]?.uptime_day_strip);
+    expect(payload.monitors[0]?.uptime_30d).toEqual({ uptime_pct: 100 });
+  });
 });
