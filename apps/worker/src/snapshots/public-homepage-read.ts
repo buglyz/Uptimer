@@ -17,9 +17,15 @@ const READ_SNAPSHOT_GENERATED_AT_SQL = `
   FROM public_snapshots
   WHERE key = ?1
 `;
+const READ_REFRESH_SNAPSHOT_ROWS_SQL = `
+  SELECT key, generated_at, body_json
+  FROM public_snapshots
+  WHERE key IN (?1, ?2)
+`;
 
 const readSnapshotStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
 const readSnapshotGeneratedAtStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
+const readRefreshSnapshotRowsStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
@@ -104,6 +110,20 @@ function snapshotBodyJsonFromParsed(value: unknown): string | null {
   return null;
 }
 
+function normalizeHomepagePayloadBodyJson(bodyJson: string): string | null {
+  if (looksLikeSerializedHomepagePayload(bodyJson)) {
+    return bodyJson;
+  }
+
+  const parsed = safeJsonParse(bodyJson);
+  if (parsed === null) return null;
+  return snapshotBodyJsonFromParsed(parsed);
+}
+
+function isSameUtcDay(a: number, b: number): boolean {
+  return Math.floor(a / 86_400) === Math.floor(b / 86_400);
+}
+
 async function readSnapshotRow(
   db: D1Database,
   key: string,
@@ -138,6 +158,26 @@ async function readSnapshotGeneratedAt(db: D1Database, key: string): Promise<num
   }
 }
 
+async function readRefreshSnapshotRows(
+  db: D1Database,
+): Promise<Array<{ key: string; generated_at: number; body_json: string }>> {
+  try {
+    const cached = readRefreshSnapshotRowsStatementByDb.get(db);
+    const statement = cached ?? db.prepare(READ_REFRESH_SNAPSHOT_ROWS_SQL);
+    if (!cached) {
+      readRefreshSnapshotRowsStatementByDb.set(db, statement);
+    }
+
+    const result = await statement
+      .bind(SNAPSHOT_ARTIFACT_KEY, SNAPSHOT_KEY)
+      .all<{ key: string; generated_at: number; body_json: string }>();
+    return result.results ?? [];
+  } catch (err) {
+    console.warn('homepage snapshot: refresh read failed', err);
+    return [];
+  }
+}
+
 export async function readHomepageSnapshotGeneratedAt(db: D1Database): Promise<number | null> {
   return (
     (await readSnapshotGeneratedAt(db, SNAPSHOT_ARTIFACT_KEY)) ??
@@ -152,6 +192,63 @@ export async function readHomepageArtifactSnapshotGeneratedAt(
     (await readSnapshotGeneratedAt(db, SNAPSHOT_ARTIFACT_KEY)) ??
     (await readSnapshotGeneratedAt(db, SNAPSHOT_KEY))
   );
+}
+
+export async function readHomepageRefreshBaseSnapshot(
+  db: D1Database,
+  now: number,
+): Promise<{
+  generatedAt: number | null;
+  bodyJson: string | null;
+  seedDataSnapshot: boolean;
+}> {
+  const rows = await readRefreshSnapshotRows(db);
+  const artifactRow = rows.find((row) => row.key === SNAPSHOT_ARTIFACT_KEY) ?? null;
+  const homepageRow = rows.find((row) => row.key === SNAPSHOT_KEY) ?? null;
+  const generatedAt = Math.max(
+    artifactRow?.generated_at ?? Number.NEGATIVE_INFINITY,
+    homepageRow?.generated_at ?? Number.NEGATIVE_INFINITY,
+  );
+
+  if (
+    homepageRow &&
+    isSameUtcDay(homepageRow.generated_at, now)
+  ) {
+    const bodyJson = normalizeHomepagePayloadBodyJson(homepageRow.body_json);
+    if (bodyJson) {
+      return {
+        generatedAt: Number.isFinite(generatedAt) ? generatedAt : homepageRow.generated_at,
+        bodyJson,
+        seedDataSnapshot: false,
+      };
+    }
+  }
+
+  const preferredBodyJson =
+    artifactRow?.body_json ?? homepageRow?.body_json ?? null;
+  if (!preferredBodyJson) {
+    return {
+      generatedAt: Number.isFinite(generatedAt) ? generatedAt : null,
+      bodyJson: null,
+      seedDataSnapshot: true,
+    };
+  }
+
+  const bodyJson = normalizeHomepagePayloadBodyJson(preferredBodyJson);
+  if (!bodyJson) {
+    console.warn('homepage snapshot: invalid refresh payload');
+    return {
+      generatedAt: Number.isFinite(generatedAt) ? generatedAt : null,
+      bodyJson: null,
+      seedDataSnapshot: true,
+    };
+  }
+
+  return {
+    generatedAt: Number.isFinite(generatedAt) ? generatedAt : null,
+    bodyJson,
+    seedDataSnapshot: true,
+  };
 }
 
 export function applyHomepageCacheHeaders(res: Response, ageSeconds: number): void {
@@ -178,9 +275,7 @@ export async function readHomepageSnapshotJsonAnyAge(
   if (age > maxStaleSeconds) return null;
 
   if (looksLikeSerializedHomepageArtifact(row.body_json)) {
-    const parsedArtifact = safeJsonParse(row.body_json);
-    if (parsedArtifact === null) return null;
-    const bodyJson = snapshotBodyJsonFromParsed(parsedArtifact);
+    const bodyJson = normalizeHomepagePayloadBodyJson(row.body_json);
     if (!bodyJson) {
       console.warn('homepage snapshot: invalid payload');
       return null;
@@ -192,9 +287,7 @@ export async function readHomepageSnapshotJsonAnyAge(
     return { bodyJson: row.body_json, age };
   }
 
-  const parsed = safeJsonParse(row.body_json);
-  if (parsed === null) return null;
-  const bodyJson = snapshotBodyJsonFromParsed(parsed);
+  const bodyJson = normalizeHomepagePayloadBodyJson(row.body_json);
   if (!bodyJson) {
     console.warn('homepage snapshot: invalid payload');
     return null;

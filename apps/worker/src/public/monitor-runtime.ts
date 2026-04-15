@@ -207,7 +207,7 @@ const runtimeEntrySchema = z
     }
   });
 
-const runtimeSnapshotSchema = z.object({
+export const publicMonitorRuntimeSnapshotSchema = z.object({
   version: z.literal(MONITOR_RUNTIME_SNAPSHOT_VERSION),
   generated_at: z.number().int().nonnegative(),
   day_start_at: z.number().int().nonnegative(),
@@ -299,7 +299,7 @@ async function readStoredMonitorRuntimeSnapshot(
     if (!row?.body_json) return null;
 
     const parsedJson = JSON.parse(row.body_json) as unknown;
-    const parsed = runtimeSnapshotSchema.safeParse(parsedJson);
+    const parsed = publicMonitorRuntimeSnapshotSchema.safeParse(parsedJson);
     if (!parsed.success) {
       console.warn('monitor runtime: invalid snapshot payload', parsed.error.message);
       return null;
@@ -620,7 +620,7 @@ export async function refreshPublicMonitorRuntimeSnapshot(opts: {
   now: number;
   updates: MonitorRuntimeUpdate[];
   rebuild: () => Promise<PublicMonitorRuntimeSnapshot>;
-}): Promise<void> {
+}): Promise<PublicMonitorRuntimeSnapshot> {
   const stored = await readStoredMonitorRuntimeSnapshot(opts.db);
   const dayStart = utcDayStart(opts.now);
   const shouldRebuild =
@@ -632,7 +632,7 @@ export async function refreshPublicMonitorRuntimeSnapshot(opts: {
   if (shouldRebuild) {
     const rebuilt = await opts.rebuild();
     await writePublicMonitorRuntimeSnapshot(opts.db, rebuilt, opts.now);
-    return;
+    return rebuilt;
   }
 
   const snapshot = stored.snapshot;
@@ -645,9 +645,10 @@ export async function refreshPublicMonitorRuntimeSnapshot(opts: {
   if (missingHistoricalEntry) {
     const rebuilt = await opts.rebuild();
     await writePublicMonitorRuntimeSnapshot(opts.db, rebuilt, opts.now);
-    return;
+    return rebuilt;
   }
 
   const next = applyMonitorRuntimeUpdates(snapshot, opts.now, opts.updates);
   await writePublicMonitorRuntimeSnapshot(opts.db, next, opts.now);
+  return next;
 }

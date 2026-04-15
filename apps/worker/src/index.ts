@@ -1,3 +1,5 @@
+import { z } from 'zod';
+
 import type { Env } from './env';
 import type { Trace } from './observability/trace';
 
@@ -27,6 +29,12 @@ function buildInternalRefreshResponse(ok: boolean, refreshed: boolean): Response
     },
   });
 }
+
+const internalRefreshJsonBodySchema = z.object({
+  token: z.string(),
+  trust_base_snapshot_monitor_metadata: z.boolean().optional(),
+  runtime_snapshot: z.unknown().optional(),
+});
 
 function finalizeInternalRefreshResponse(
   res: Response,
@@ -60,7 +68,38 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
     return new Response('Method Not Allowed', { status: 405 });
   }
 
-  const token = (await request.text()).trim();
+  let token = '';
+  let runtimeSnapshot: import('./public/monitor-runtime').PublicMonitorRuntimeSnapshot | null =
+    null;
+  let trustBaseSnapshotMonitorMetadata = false;
+  const contentType = request.headers.get('Content-Type') ?? '';
+
+  if (contentType.includes('application/json')) {
+    const parsedBody = internalRefreshJsonBodySchema.safeParse(
+      await request.json().catch(() => null),
+    );
+    if (!parsedBody.success) {
+      return new Response('Forbidden', { status: 403 });
+    }
+
+    token = parsedBody.data.token.trim();
+    trustBaseSnapshotMonitorMetadata =
+      parsedBody.data.trust_base_snapshot_monitor_metadata === true;
+
+    if (parsedBody.data.runtime_snapshot !== undefined) {
+      const { publicMonitorRuntimeSnapshotSchema } = await import('./public/monitor-runtime');
+      const parsedRuntimeSnapshot = publicMonitorRuntimeSnapshotSchema.safeParse(
+        parsedBody.data.runtime_snapshot,
+      );
+      if (!parsedRuntimeSnapshot.success) {
+        return new Response('Forbidden', { status: 403 });
+      }
+      runtimeSnapshot = parsedRuntimeSnapshot.data;
+    }
+  } else {
+    token = (await request.text()).trim();
+  }
+
   if (!env.ADMIN_TOKEN || token !== env.ADMIN_TOKEN) {
     return new Response('Forbidden', { status: 403 });
   }
@@ -87,7 +126,10 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
   }
 
   try {
-    const { readHomepageSnapshotGeneratedAt, readHomepageSnapshotJsonAnyAge } = trace
+    const {
+      readHomepageRefreshBaseSnapshot,
+      readHomepageSnapshotGeneratedAt,
+    } = trace
       ? await trace.timeAsync(
           'import_homepage_snapshot_read_module',
           async () => await import('./snapshots/public-homepage-read'),
@@ -149,13 +191,13 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
       );
     }
 
-    const latestGeneratedAt = trace
+    const baseSnapshot = trace
       ? await trace.timeAsync(
-          'homepage_refresh_read_generated_at_2',
-          async () => await readHomepageSnapshotGeneratedAt(env.DB),
+          'homepage_refresh_read_snapshot_base',
+          async () => await readHomepageRefreshBaseSnapshot(env.DB, now),
         )
-      : await readHomepageSnapshotGeneratedAt(env.DB);
-    if (latestGeneratedAt !== null && isSameMinute(latestGeneratedAt, now)) {
+      : await readHomepageRefreshBaseSnapshot(env.DB, now);
+    if (baseSnapshot.generatedAt !== null && isSameMinute(baseSnapshot.generatedAt, now)) {
       if (trace?.enabled) {
         trace.setLabel('skip', 'fresh_after_lease');
       }
@@ -166,26 +208,6 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
         { refreshed: false },
       );
     }
-
-    const baseSnapshotBodyJson = trace
-      ? await trace.timeAsync(
-          'homepage_refresh_read_snapshot_base',
-          async () =>
-            (
-              await readHomepageSnapshotJsonAnyAge(
-                env.DB,
-                now,
-                10 * 60,
-              )
-            )?.bodyJson ?? null,
-        )
-      : (
-          await readHomepageSnapshotJsonAnyAge(
-            env.DB,
-            now,
-            10 * 60,
-          )
-        )?.bodyJson ?? null;
 
     const [homepageMod, snapshotMod] = await Promise.all([
       trace
@@ -204,10 +226,16 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
           async () =>
             await homepageMod.computePublicHomepagePayload(env.DB, now, {
               trace,
-              baseSnapshotBodyJson,
+              baseSnapshotBodyJson: baseSnapshot.bodyJson,
+              runtimeSnapshot,
+              trustBaseSnapshotMonitorMetadata,
             }),
         )
-      : await homepageMod.computePublicHomepagePayload(env.DB, now, { baseSnapshotBodyJson });
+      : await homepageMod.computePublicHomepagePayload(env.DB, now, {
+          baseSnapshotBodyJson: baseSnapshot.bodyJson,
+          runtimeSnapshot,
+          trustBaseSnapshotMonitorMetadata,
+        });
     const payload = trace
       ? trace.time('homepage_refresh_validate', () =>
           snapshotMod.toHomepageSnapshotPayload(computed),
@@ -216,10 +244,23 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
     if (trace) {
       await trace.timeAsync(
         'homepage_refresh_write',
-        async () => await snapshotMod.writeHomepageSnapshot(env.DB, now, payload, trace),
+        async () =>
+          await snapshotMod.writeHomepageSnapshot(
+            env.DB,
+            now,
+            payload,
+            trace,
+            baseSnapshot.seedDataSnapshot,
+          ),
       );
     } else {
-      await snapshotMod.writeHomepageSnapshot(env.DB, now, payload);
+      await snapshotMod.writeHomepageSnapshot(
+        env.DB,
+        now,
+        payload,
+        undefined,
+        baseSnapshot.seedDataSnapshot,
+      );
     }
 
     return finalizeInternalRefreshResponse(

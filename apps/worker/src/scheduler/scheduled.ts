@@ -18,6 +18,7 @@ import type { CheckOutcome } from '../monitor/types';
 import { rebuildPublicMonitorRuntimeSnapshot } from '../public/monitor-runtime-bootstrap';
 import {
   refreshPublicMonitorRuntimeSnapshot,
+  type PublicMonitorRuntimeSnapshot,
   type MonitorRuntimeUpdate,
 } from '../public/monitor-runtime';
 import { readSettings } from '../settings';
@@ -39,16 +40,43 @@ const PERSIST_BATCH_SIZE = Math.max(
   ),
 );
 
-async function refreshHomepageSnapshotInline(env: Env, now: number): Promise<void> {
-  const [{ computePublicHomepagePayload }, { refreshPublicHomepageSnapshot }] = await Promise.all([
+type HomepageRefreshContext = {
+  runtimeSnapshot?: PublicMonitorRuntimeSnapshot | null;
+  trustBaseSnapshotMonitorMetadata?: boolean;
+};
+
+async function refreshHomepageSnapshotInline(
+  env: Env,
+  now: number,
+  context: HomepageRefreshContext = {},
+): Promise<void> {
+  const [
+    { computePublicHomepagePayload },
+    { refreshPublicHomepageSnapshot },
+    { readHomepageRefreshBaseSnapshot },
+  ] = await Promise.all([
     import('../public/homepage'),
     import('../snapshots'),
+    import('../snapshots/public-homepage-read'),
   ]);
+  const baseSnapshot = await readHomepageRefreshBaseSnapshot(env.DB, now);
 
   await refreshPublicHomepageSnapshot({
     db: env.DB,
     now,
-    compute: () => computePublicHomepagePayload(env.DB, now),
+    compute: () =>
+      computePublicHomepagePayload(env.DB, now, {
+        baseSnapshotBodyJson: baseSnapshot.bodyJson,
+        ...(context.runtimeSnapshot !== undefined
+          ? { runtimeSnapshot: context.runtimeSnapshot }
+          : {}),
+        ...(context.trustBaseSnapshotMonitorMetadata !== undefined
+          ? {
+              trustBaseSnapshotMonitorMetadata: context.trustBaseSnapshotMonitorMetadata,
+            }
+          : {}),
+      }),
+    seedDataSnapshot: baseSnapshot.seedDataSnapshot,
   });
 }
 
@@ -56,7 +84,10 @@ type HomepageRefreshServiceResult = {
   refreshed: boolean | null;
 };
 
-async function refreshHomepageSnapshotViaService(env: Env): Promise<HomepageRefreshServiceResult> {
+async function refreshHomepageSnapshotViaService(
+  env: Env,
+  context: HomepageRefreshContext = {},
+): Promise<HomepageRefreshServiceResult> {
   if (!env.SELF) {
     throw new Error('SELF service binding missing');
   }
@@ -64,14 +95,23 @@ async function refreshHomepageSnapshotViaService(env: Env): Promise<HomepageRefr
     throw new Error('ADMIN_TOKEN missing');
   }
 
+  const useJsonBody =
+    context.runtimeSnapshot !== undefined || context.trustBaseSnapshotMonitorMetadata === true;
   const res = await env.SELF.fetch(
     new Request('http://internal/api/v1/internal/refresh/homepage', {
       method: 'POST',
       headers: {
-        'Content-Type': 'text/plain; charset=utf-8',
+        'Content-Type': useJsonBody ? 'application/json; charset=utf-8' : 'text/plain; charset=utf-8',
         'X-Uptimer-Refresh-Source': 'scheduled',
       },
-      body: env.ADMIN_TOKEN,
+      body: useJsonBody
+        ? JSON.stringify({
+            token: env.ADMIN_TOKEN,
+            runtime_snapshot: context.runtimeSnapshot ?? undefined,
+            trust_base_snapshot_monitor_metadata:
+              context.trustBaseSnapshotMonitorMetadata === true ? true : undefined,
+          })
+        : env.ADMIN_TOKEN,
     }),
   );
 
@@ -595,15 +635,15 @@ async function persistCompletedMonitors(
 export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise<void> {
   const now = Math.floor(Date.now() / 1000);
   const checkedAt = Math.floor(now / 60) * 60;
-  const queueHomepageRefresh = () =>
+  const queueHomepageRefresh = (context: HomepageRefreshContext = {}) =>
     env.SELF
-      ? refreshHomepageSnapshotViaService(env).catch(async (err) => {
+      ? refreshHomepageSnapshotViaService(env, context).catch(async (err) => {
           console.warn('homepage snapshot: service refresh failed', err);
-          await refreshHomepageSnapshotInline(env, now).catch((fallbackErr) => {
+          await refreshHomepageSnapshotInline(env, now, context).catch((fallbackErr) => {
             console.warn('homepage snapshot: refresh failed', fallbackErr);
           });
         })
-      : refreshHomepageSnapshotInline(env, now).catch((err) => {
+      : refreshHomepageSnapshotInline(env, now, context).catch((err) => {
           console.warn('homepage snapshot: refresh failed', err);
         });
 
@@ -634,7 +674,11 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
   };
 
   if (due.length === 0) {
-    ctx.waitUntil(queueHomepageRefresh());
+    ctx.waitUntil(
+      queueHomepageRefresh({
+        trustBaseSnapshotMonitorMetadata: true,
+      }),
+    );
     return;
   }
 
@@ -656,10 +700,11 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
   const completed = settled
     .filter((r): r is PromiseFulfilledResult<CompletedDueMonitor> => r.status === 'fulfilled')
     .map((r) => r.value);
+  let runtimeSnapshot: PublicMonitorRuntimeSnapshot | null = null;
 
   if (completed.length > 0) {
     await persistCompletedMonitors(env.DB, completed);
-    await refreshPublicMonitorRuntimeSnapshot({
+    runtimeSnapshot = await refreshPublicMonitorRuntimeSnapshot({
       db: env.DB,
       now,
       updates: completed.map(toMonitorRuntimeUpdate),
@@ -705,5 +750,10 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
     );
   }
 
-  ctx.waitUntil(queueHomepageRefresh());
+  ctx.waitUntil(
+    queueHomepageRefresh({
+      runtimeSnapshot,
+      trustBaseSnapshotMonitorMetadata: true,
+    }),
+  );
 }

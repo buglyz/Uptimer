@@ -83,6 +83,8 @@ function queuePublicHomepageSnapshotRefresh(c: { env: Env; executionCtx: Executi
     refreshPublicHomepageSnapshotIfNeeded({
       db: c.env.DB,
       now,
+      force: true,
+      seedDataSnapshot: true,
       compute: () => computePublicHomepagePayload(c.env.DB, Math.floor(Date.now() / 1000)),
     }).catch((err) => {
       console.warn('homepage snapshot: refresh failed', err);

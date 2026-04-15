@@ -60,6 +60,11 @@ function createEnv(options: CreateEnvOptions = {}): Env {
 
   const handlers: FakeD1QueryHandler[] = [
     {
+      match: 'from public_snapshots',
+      all: () => [],
+      first: () => null,
+    },
+    {
       match: 'from notification_channels',
       all: () => channels,
     },
@@ -170,7 +175,12 @@ describe('scheduler/scheduled regression', () => {
       resolved_incident_preview: null,
       maintenance_history_preview: null,
     } as never);
-    vi.mocked(refreshPublicMonitorRuntimeSnapshot).mockResolvedValue(undefined);
+    vi.mocked(refreshPublicMonitorRuntimeSnapshot).mockResolvedValue({
+      version: 1,
+      generated_at: Math.floor(Date.now() / 1000),
+      day_start_at: Math.floor(Math.floor(Date.now() / 1000) / 86_400) * 86_400,
+      monitors: [],
+    });
     vi.mocked(refreshPublicHomepageSnapshot).mockResolvedValue(undefined);
     vi.mocked(runHttpCheck).mockResolvedValue({
       status: 'up',
@@ -220,11 +230,16 @@ describe('scheduler/scheduled regression', () => {
       db: env.DB,
       now: expectedNow,
       compute: expect.any(Function),
+      seedDataSnapshot: true,
     });
     const refreshArgs = vi.mocked(refreshPublicHomepageSnapshot).mock.calls[0]?.[0];
     expect(refreshArgs).toBeDefined();
     await refreshArgs?.compute();
-    expect(computePublicHomepagePayload).toHaveBeenCalledWith(env.DB, expectedNow);
+    expect(computePublicHomepagePayload).toHaveBeenCalledWith(env.DB, expectedNow, {
+      baseSnapshotBodyJson: null,
+      runtimeSnapshot: undefined,
+      trustBaseSnapshotMonitorMetadata: true,
+    });
   });
 
   it('self-invokes homepage refresh via service binding when SELF is configured', async () => {
@@ -244,7 +259,11 @@ describe('scheduler/scheduled regression', () => {
     expect(req).toBeInstanceOf(Request);
     expect(req.method).toBe('POST');
     expect(new URL(req.url).pathname).toBe('/api/v1/internal/refresh/homepage');
-    expect(await req.text()).toBe('test-admin-token');
+    expect(req.headers.get('Content-Type')).toBe('application/json; charset=utf-8');
+    await expect(req.json()).resolves.toEqual({
+      token: 'test-admin-token',
+      trust_base_snapshot_monitor_metadata: true,
+    });
     expect(refreshPublicHomepageSnapshot).not.toHaveBeenCalled();
   });
 

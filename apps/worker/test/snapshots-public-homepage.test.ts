@@ -21,6 +21,7 @@ import {
   writeHomepageArtifactSnapshot,
   writeHomepageSnapshot,
 } from '../src/snapshots/public-homepage';
+import { readHomepageRefreshBaseSnapshot } from '../src/snapshots/public-homepage-read';
 import { createFakeD1Database } from './helpers/fake-d1';
 
 function samplePayload(now = 1_728_000_000) {
@@ -235,6 +236,27 @@ describe('snapshots/public-homepage', () => {
     ]);
   });
 
+  it('seeds the compact homepage payload row when requested', async () => {
+    const boundArgs: unknown[][] = [];
+    const db = createFakeD1Database([
+      {
+        match: 'insert into public_snapshots',
+        run: (args) => {
+          boundArgs.push(args);
+          return { meta: { changes: 1 } };
+        },
+      },
+    ]);
+
+    const payload = samplePayload(280);
+    await writeHomepageSnapshot(db, 300, payload, undefined, true);
+
+    expect(boundArgs).toEqual([
+      ['homepage', 280, JSON.stringify(payload), 300],
+      ['homepage:artifact', 280, JSON.stringify(buildHomepageRenderArtifact(payload)), 300],
+    ]);
+  });
+
   it('writes artifact-only homepage snapshots without touching the full payload row', async () => {
     const boundArgs: unknown[][] = [];
     const db = createFakeD1Database([
@@ -350,6 +372,75 @@ describe('snapshots/public-homepage', () => {
     expect(writtenArgs).toEqual([
       ['homepage:artifact', now, JSON.stringify(storedRender), now],
     ]);
+  });
+
+  it('forces a refresh within the same minute for admin-triggered invalidations', async () => {
+    vi.mocked(acquireLease).mockResolvedValue(true);
+
+    const writtenArgs: unknown[][] = [];
+    const now = 1_728_000_045;
+    const payload = samplePayload(now);
+    const db = createFakeD1Database([
+      {
+        match: 'from public_snapshots',
+        first: () => ({
+          generated_at: now - 5,
+          body_json: JSON.stringify(samplePayload(now - 5)),
+        }),
+      },
+      {
+        match: 'insert into public_snapshots',
+        run: (args) => {
+          writtenArgs.push(args);
+          return { meta: { changes: 1 } };
+        },
+      },
+    ]);
+
+    const compute = vi.fn(async () => payload);
+    const refreshed = await refreshPublicHomepageSnapshotIfNeeded({
+      db,
+      now,
+      compute,
+      force: true,
+      seedDataSnapshot: true,
+    });
+
+    expect(refreshed).toBe(true);
+    expect(compute).toHaveBeenCalledTimes(1);
+    expect(writtenArgs).toEqual([
+      ['homepage', now, JSON.stringify(payload), now],
+      ['homepage:artifact', now, JSON.stringify(buildHomepageRenderArtifact(payload)), now],
+    ]);
+  });
+
+  it('prefers the same-day compact homepage row as the internal refresh base snapshot', async () => {
+    const now = 1_728_000_500;
+    const payload = samplePayload(now - 300);
+    const artifactPayload = samplePayload(now - 60);
+    const db = createFakeD1Database([
+      {
+        match: 'select key, generated_at, body_json',
+        all: () => [
+          {
+            key: 'homepage:artifact',
+            generated_at: artifactPayload.generated_at,
+            body_json: JSON.stringify(buildHomepageRenderArtifact(artifactPayload)),
+          },
+          {
+            key: 'homepage',
+            generated_at: payload.generated_at,
+            body_json: JSON.stringify(payload),
+          },
+        ],
+      },
+    ]);
+
+    await expect(readHomepageRefreshBaseSnapshot(db, now)).resolves.toEqual({
+      generatedAt: artifactPayload.generated_at,
+      bodyJson: JSON.stringify(payload),
+      seedDataSnapshot: false,
+    });
   });
 
   it('refreshes only the artifact snapshot when the scheduler path requests it', async () => {

@@ -88,6 +88,8 @@ type HomepageMonitorDataOptions = {
   uptimeRatingLevel?: 1 | 2 | 3 | 4 | 5;
   maintenanceMonitorIdsPromise?: Promise<ReadonlySet<number>>;
   baseSnapshot?: PublicHomepageResponse | null;
+  runtimeSnapshot?: PublicMonitorRuntimeSnapshot | null;
+  trustBaseSnapshotMonitorMetadata?: boolean;
   trace?: Trace;
 };
 
@@ -431,6 +433,26 @@ function canReuseBaseSnapshotMonitorMetadata(opts: {
 
   const monitorIds = baseSnapshot.monitors.map((monitor) => monitor.id);
   if (!snapshotHasMonitorIds(runtimeSnapshot, monitorIds)) {
+    return false;
+  }
+
+  const runtimeById = toMonitorRuntimeEntryMap(runtimeSnapshot);
+  return baseSnapshot.monitors.every((monitor) => hasReusableRuntimeCreatedAt(runtimeById.get(monitor.id)));
+}
+
+function canTrustBaseSnapshotMonitorMetadata(opts: {
+  baseSnapshot: PublicHomepageResponse | null | undefined;
+  runtimeSnapshot: PublicMonitorRuntimeSnapshot | null;
+}): boolean {
+  const { baseSnapshot, runtimeSnapshot } = opts;
+  if (!baseSnapshot || !runtimeSnapshot) {
+    return false;
+  }
+
+  if (
+    baseSnapshot.monitor_count_total !== baseSnapshot.monitors.length ||
+    !snapshotHasMonitorIds(runtimeSnapshot, baseSnapshot.monitors.map((monitor) => monitor.id))
+  ) {
     return false;
   }
 
@@ -917,15 +939,21 @@ async function buildHomepageMonitorData(
   const trace = opts.trace;
   const baseSnapshot = opts.baseSnapshot ?? null;
   const runtimeSnapshotPromise =
-    baseSnapshot === null
-      ? Promise.resolve<PublicMonitorRuntimeSnapshot | null | undefined>(undefined)
-      : withTraceAsync(
+    opts.runtimeSnapshot !== undefined
+      ? withTraceAsync(
           trace,
-          'homepage_cards_runtime_cache_read',
-          async () => await readPublicMonitorRuntimeSnapshot(db, now),
-        );
+          'homepage_cards_runtime_cache_reuse',
+          async () => opts.runtimeSnapshot,
+        )
+      : baseSnapshot === null
+        ? Promise.resolve<PublicMonitorRuntimeSnapshot | null | undefined>(undefined)
+        : withTraceAsync(
+            trace,
+            'homepage_cards_runtime_cache_read',
+            async () => await readPublicMonitorRuntimeSnapshot(db, now),
+          );
   const monitorMetadataStampPromise =
-    baseSnapshot === null
+    baseSnapshot === null || opts.trustBaseSnapshotMonitorMetadata
       ? Promise.resolve<HomepageMonitorMetadataStamp | null>(null)
       : withTraceAsync(
           trace,
@@ -937,11 +965,16 @@ async function buildHomepageMonitorData(
     monitorMetadataStampPromise,
   ]);
 
-  const reuseBaseMonitorRows = canReuseBaseSnapshotMonitorMetadata({
-    baseSnapshot,
-    metadataStamp: monitorMetadataStamp,
-    runtimeSnapshot: runtimeSnapshot ?? null,
-  });
+  const reuseBaseMonitorRows = opts.trustBaseSnapshotMonitorMetadata
+    ? canTrustBaseSnapshotMonitorMetadata({
+        baseSnapshot,
+        runtimeSnapshot: runtimeSnapshot ?? null,
+      })
+    : canReuseBaseSnapshotMonitorMetadata({
+        baseSnapshot,
+        metadataStamp: monitorMetadataStamp,
+        runtimeSnapshot: runtimeSnapshot ?? null,
+      });
   const rawMonitors =
     reuseBaseMonitorRows &&
     baseSnapshot !== null &&
@@ -1268,7 +1301,12 @@ export function homepageFromStatusPayload(
 export async function computePublicHomepagePayload(
   db: D1Database,
   now: number,
-  opts: { trace?: Trace; baseSnapshotBodyJson?: string | null } = {},
+  opts: {
+    trace?: Trace;
+    baseSnapshotBodyJson?: string | null;
+    runtimeSnapshot?: PublicMonitorRuntimeSnapshot | null;
+    trustBaseSnapshotMonitorMetadata?: boolean;
+  } = {},
 ): Promise<PublicHomepageResponse> {
   const trace = opts.trace;
   const includeHiddenMonitors = false;
@@ -1310,6 +1348,14 @@ export async function computePublicHomepagePayload(
                 collectMaintenanceMonitorIds(resolvedMaintenance.active),
               ),
               baseSnapshot,
+              ...(opts.runtimeSnapshot !== undefined
+                ? { runtimeSnapshot: opts.runtimeSnapshot }
+                : {}),
+              ...(opts.trustBaseSnapshotMonitorMetadata !== undefined
+                ? {
+                    trustBaseSnapshotMonitorMetadata: opts.trustBaseSnapshotMonitorMetadata,
+                  }
+                : {}),
               ...(trace ? { trace } : {}),
             }),
           ),
