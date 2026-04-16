@@ -26,6 +26,9 @@ vi.mock('../src/public/monitor-runtime', async (importOriginal) => {
     refreshPublicMonitorRuntimeSnapshot: vi.fn(),
   };
 });
+vi.mock('../src/public/monitor-runtime-bootstrap', () => ({
+  rebuildPublicMonitorRuntimeSnapshot: vi.fn(),
+}));
 vi.mock('../src/snapshots', () => ({
   refreshPublicHomepageSnapshotIfNeeded: vi.fn(),
 }));
@@ -35,8 +38,9 @@ import { runHttpCheck } from '../src/monitor/http';
 import { runTcpCheck } from '../src/monitor/tcp';
 import { dispatchWebhookToChannels } from '../src/notify/webhook';
 import { computePublicHomepagePayload } from '../src/public/homepage';
+import { rebuildPublicMonitorRuntimeSnapshot } from '../src/public/monitor-runtime-bootstrap';
 import { refreshPublicMonitorRuntimeSnapshot } from '../src/public/monitor-runtime';
-import { runScheduledTick } from '../src/scheduler/scheduled';
+import { listMonitorRowsByIds, runScheduledTick } from '../src/scheduler/scheduled';
 import { acquireLease, releaseLease } from '../src/scheduler/lock';
 import { refreshPublicHomepageSnapshotIfNeeded } from '../src/snapshots';
 import { readSettings } from '../src/settings';
@@ -187,6 +191,12 @@ describe('scheduler/scheduled regression', () => {
       day_start_at: Math.floor(Math.floor(Date.now() / 1000) / 86_400) * 86_400,
       monitors: [],
     });
+    vi.mocked(rebuildPublicMonitorRuntimeSnapshot).mockResolvedValue({
+      version: 1,
+      generated_at: Math.floor(Date.now() / 1000),
+      day_start_at: Math.floor(Math.floor(Date.now() / 1000) / 86_400) * 86_400,
+      monitors: [],
+    });
     vi.mocked(refreshPublicHomepageSnapshotIfNeeded).mockResolvedValue(false);
     vi.mocked(runHttpCheck).mockResolvedValue({
       status: 'up',
@@ -219,6 +229,44 @@ describe('scheduler/scheduled regression', () => {
 
     expect(readSettings).not.toHaveBeenCalled();
     expect(waitUntil).not.toHaveBeenCalled();
+  });
+
+  it('lists monitor rows by id with invalid ids filtered out', async () => {
+    const env = createEnv({
+      dueRows: [
+        {
+          id: 2,
+          name: 'API',
+          type: 'http',
+          target: 'https://example.com',
+          interval_sec: 60,
+          created_at: 1_760_000_000,
+          timeout_ms: 10_000,
+          http_method: 'GET',
+          http_headers_json: null,
+          http_body: null,
+          expected_status_json: null,
+          response_keyword: null,
+          response_keyword_mode: null,
+          response_forbidden_keyword: null,
+          response_forbidden_keyword_mode: null,
+          state_status: 'up',
+          state_last_error: null,
+          last_checked_at: 1_760_000_060,
+          last_changed_at: 1_760_000_000,
+          consecutive_failures: 0,
+          consecutive_successes: 1,
+        },
+      ],
+    });
+
+    await expect(listMonitorRowsByIds(env.DB, [0, -1, 2, 2])).resolves.toEqual([
+      expect.objectContaining({
+        id: 2,
+        name: 'API',
+      }),
+    ]);
+    await expect(listMonitorRowsByIds(env.DB, [0, -1])).resolves.toEqual([]);
   });
 
   it('returns without background work when no monitors are due', async () => {
@@ -364,6 +412,403 @@ describe('scheduler/scheduled regression', () => {
         },
       ],
     });
+  });
+
+  it('uses internal service batches for large due sets and normalizes returned runtime updates', async () => {
+    const checkedAt = Math.floor(Math.floor(Date.now() / 1000) / 60) * 60;
+    const dueRows = Array.from({ length: 7 }, (_, index) => ({
+      id: index + 1,
+      name: `API ${index + 1}`,
+      type: 'http',
+      target: `https://example.com/${index + 1}`,
+      interval_sec: 60,
+      created_at: 1_760_000_000 + index,
+      timeout_ms: 10_000,
+      http_method: 'GET',
+      http_headers_json: null,
+      http_body: null,
+      expected_status_json: null,
+      response_keyword: null,
+      response_keyword_mode: null,
+      response_forbidden_keyword: null,
+      response_forbidden_keyword_mode: null,
+      state_status: 'up',
+      state_last_error: null,
+      last_checked_at: checkedAt - 60,
+      last_changed_at: 1_760_000_000,
+      consecutive_failures: 0,
+      consecutive_successes: 1,
+    }));
+    const env = createEnv({ dueRows }) as unknown as Env;
+    env.ADMIN_TOKEN = 'test-admin-token';
+    const selfFetch = vi.fn(async (req: Request) => {
+      const pathname = new URL(req.url).pathname;
+      if (pathname === '/api/v1/internal/scheduled/check-batch') {
+        const body = (await req.json()) as {
+          ids: number[];
+          checked_at: number;
+          state_failures_to_down_from_up: number;
+          state_successes_to_up_from_down: number;
+        };
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            runtime_updates: body.ids.map((id, batchIndex) => ({
+              monitor_id: id,
+              interval_sec: 60,
+              created_at: 1_760_000_000 + id,
+              checked_at: body.checked_at,
+              check_status: 'up',
+              next_status: 'up',
+              latency_ms: batchIndex === 0 ? -3.7 : 21,
+            })),
+            processed_count: body.ids.length,
+            rejected_count: 0,
+            attempt_total: body.ids.length,
+            http_count: body.ids.length,
+            tcp_count: 0,
+            assertion_count: 0,
+            down_count: 0,
+            unknown_count: 0,
+            checks_duration_ms: 4,
+            persist_duration_ms: 2,
+          }),
+          { status: 200 },
+        );
+      }
+      if (pathname === '/api/v1/internal/refresh/homepage') {
+        return new Response(JSON.stringify({ ok: true, refreshed: true }), { status: 200 });
+      }
+      throw new Error(`unexpected self fetch: ${pathname}`);
+    });
+    env.SELF = { fetch: selfFetch } as unknown as Fetcher;
+    const waitUntil = vi.fn();
+
+    await runScheduledTick(env, { waitUntil } as unknown as ExecutionContext);
+    await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
+
+    expect(runHttpCheck).not.toHaveBeenCalled();
+    expect(selfFetch).toHaveBeenCalledTimes(3);
+    expect(refreshPublicMonitorRuntimeSnapshot).toHaveBeenCalledWith({
+      db: env.DB,
+      now: Math.floor(Date.now() / 1000),
+      updates: [
+        {
+          monitor_id: 1,
+          interval_sec: 60,
+          created_at: 1_760_000_001,
+          checked_at: checkedAt,
+          check_status: 'up',
+          next_status: 'up',
+          latency_ms: 0,
+        },
+        {
+          monitor_id: 2,
+          interval_sec: 60,
+          created_at: 1_760_000_002,
+          checked_at: checkedAt,
+          check_status: 'up',
+          next_status: 'up',
+          latency_ms: 21,
+        },
+        {
+          monitor_id: 3,
+          interval_sec: 60,
+          created_at: 1_760_000_003,
+          checked_at: checkedAt,
+          check_status: 'up',
+          next_status: 'up',
+          latency_ms: 21,
+        },
+        {
+          monitor_id: 4,
+          interval_sec: 60,
+          created_at: 1_760_000_004,
+          checked_at: checkedAt,
+          check_status: 'up',
+          next_status: 'up',
+          latency_ms: 21,
+        },
+        {
+          monitor_id: 5,
+          interval_sec: 60,
+          created_at: 1_760_000_005,
+          checked_at: checkedAt,
+          check_status: 'up',
+          next_status: 'up',
+          latency_ms: 21,
+        },
+        {
+          monitor_id: 6,
+          interval_sec: 60,
+          created_at: 1_760_000_006,
+          checked_at: checkedAt,
+          check_status: 'up',
+          next_status: 'up',
+          latency_ms: 21,
+        },
+        {
+          monitor_id: 7,
+          interval_sec: 60,
+          created_at: 1_760_000_007,
+          checked_at: checkedAt,
+          check_status: 'up',
+          next_status: 'up',
+          latency_ms: 0,
+        },
+      ],
+      rebuild: expect.any(Function),
+    });
+    const runtimeRefreshArgs = vi.mocked(refreshPublicMonitorRuntimeSnapshot).mock.calls[0]?.[0];
+    expect(runtimeRefreshArgs).toBeDefined();
+    await expect(runtimeRefreshArgs?.rebuild()).resolves.toEqual({
+      version: 1,
+      generated_at: Math.floor(Date.now() / 1000),
+      day_start_at: Math.floor(Math.floor(Date.now() / 1000) / 86_400) * 86_400,
+      monitors: [],
+    });
+  });
+
+  it('falls back inline when a service batch returns invalid runtime updates', async () => {
+    const checkedAt = Math.floor(Math.floor(Date.now() / 1000) / 60) * 60;
+    const dueRows = Array.from({ length: 7 }, (_, index) => ({
+      id: index + 1,
+      name: `API ${index + 1}`,
+      type: 'http',
+      target: `https://example.com/${index + 1}`,
+      interval_sec: 60,
+      created_at: 1_760_000_000 + index,
+      timeout_ms: 10_000,
+      http_method: 'GET',
+      http_headers_json: null,
+      http_body: null,
+      expected_status_json: null,
+      response_keyword: null,
+      response_keyword_mode: null,
+      response_forbidden_keyword: null,
+      response_forbidden_keyword_mode: null,
+      state_status: 'up',
+      state_last_error: null,
+      last_checked_at: checkedAt - 60,
+      last_changed_at: 1_760_000_000,
+      consecutive_failures: 0,
+      consecutive_successes: 1,
+    }));
+    const env = createEnv({ dueRows }) as unknown as Env;
+    env.ADMIN_TOKEN = 'test-admin-token';
+    const selfFetch = vi.fn(async (req: Request) => {
+      const pathname = new URL(req.url).pathname;
+      if (pathname === '/api/v1/internal/scheduled/check-batch') {
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            runtime_updates: [
+              {
+                monitor_id: 1,
+                interval_sec: 60,
+                created_at: 1_760_000_001,
+                checked_at: checkedAt,
+                check_status: 'degraded',
+                next_status: 'up',
+                latency_ms: 12,
+              },
+            ],
+            processed_count: 1,
+            rejected_count: 0,
+            attempt_total: 1,
+            http_count: 1,
+            tcp_count: 0,
+            assertion_count: 0,
+            down_count: 0,
+            unknown_count: 0,
+            checks_duration_ms: 4,
+            persist_duration_ms: 2,
+          }),
+          { status: 200 },
+        );
+      }
+      if (pathname === '/api/v1/internal/refresh/homepage') {
+        return new Response(JSON.stringify({ ok: true, refreshed: true }), { status: 200 });
+      }
+      throw new Error(`unexpected self fetch: ${pathname}`);
+    });
+    env.SELF = { fetch: selfFetch } as unknown as Fetcher;
+    const waitUntil = vi.fn();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    try {
+      await runScheduledTick(env, { waitUntil } as unknown as ExecutionContext);
+      await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
+
+      expect(runHttpCheck).toHaveBeenCalledTimes(7);
+      expect(warn).toHaveBeenCalledWith(
+        'scheduled: service batch failed, falling back inline',
+        expect.any(Error),
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('falls back to inline homepage refresh when the internal refresh service fails', async () => {
+    const env = createEnv({ dueRows: [] }) as unknown as Env;
+    env.ADMIN_TOKEN = 'test-admin-token';
+    env.SELF = {
+      fetch: vi.fn().mockRejectedValueOnce(new Error('service refresh failed')),
+    } as unknown as Fetcher;
+    const waitUntil = vi.fn();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    try {
+      await runScheduledTick(env, { waitUntil } as unknown as ExecutionContext);
+      await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
+
+      expect(warn).toHaveBeenCalledWith(
+        'homepage snapshot: service refresh failed',
+        expect.any(Error),
+      );
+      expect(refreshPublicHomepageSnapshotIfNeeded).toHaveBeenCalledWith({
+        db: env.DB,
+        now: Math.floor(Date.now() / 1000),
+        compute: expect.any(Function),
+        seedDataSnapshot: true,
+      });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('logs inline homepage refresh fallback failures after a service refresh error', async () => {
+    vi.mocked(refreshPublicHomepageSnapshotIfNeeded).mockRejectedValueOnce(
+      new Error('inline refresh failed'),
+    );
+    const env = createEnv({ dueRows: [] }) as unknown as Env;
+    env.ADMIN_TOKEN = 'test-admin-token';
+    env.SELF = {
+      fetch: vi.fn().mockRejectedValueOnce(new Error('service refresh failed')),
+    } as unknown as Fetcher;
+    const waitUntil = vi.fn();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    try {
+      await runScheduledTick(env, { waitUntil } as unknown as ExecutionContext);
+      await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
+
+      expect(warn).toHaveBeenCalledWith(
+        'homepage snapshot: service refresh failed',
+        expect.any(Error),
+      );
+      expect(warn).toHaveBeenCalledWith('homepage snapshot: refresh failed', expect.any(Error));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('logs lease release failures after the tick completes', async () => {
+    vi.mocked(releaseLease).mockRejectedValueOnce(new Error('release failed'));
+    const env = createEnv({ dueRows: [] });
+    const waitUntil = vi.fn();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    try {
+      await runScheduledTick(env, { waitUntil } as unknown as ExecutionContext);
+      await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
+
+      expect(warn).toHaveBeenCalledWith('scheduled: failed to release lease', expect.any(Error));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('keeps inline notifications when a service batch falls back with active channels', async () => {
+    vi.mocked(runHttpCheck).mockResolvedValue({
+      status: 'down',
+      latencyMs: 91,
+      httpStatus: 503,
+      error: 'HTTP 503',
+      attempts: 1,
+    });
+    const checkedAt = Math.floor(Math.floor(Date.now() / 1000) / 60) * 60;
+    const dueRows = Array.from({ length: 7 }, (_, index) => ({
+      id: index + 1,
+      name: `API ${index + 1}`,
+      type: 'http',
+      target: `https://example.com/${index + 1}`,
+      interval_sec: 60,
+      created_at: 1_760_000_000 + index,
+      timeout_ms: 10_000,
+      http_method: 'GET',
+      http_headers_json: null,
+      http_body: null,
+      expected_status_json: null,
+      response_keyword: null,
+      response_keyword_mode: null,
+      response_forbidden_keyword: null,
+      response_forbidden_keyword_mode: null,
+      state_status: 'up',
+      state_last_error: null,
+      last_checked_at: checkedAt - 60,
+      last_changed_at: 1_760_000_000,
+      consecutive_failures: 1,
+      consecutive_successes: 0,
+    }));
+    const channels = [
+      {
+        id: 1,
+        name: 'primary',
+        config_json: JSON.stringify({
+          url: 'https://hooks.example.com/uptimer',
+          method: 'POST',
+          payload_type: 'json',
+        }),
+        created_at: 1700000000,
+      },
+    ];
+    const env = createEnv({ dueRows, channels }) as unknown as Env;
+    env.ADMIN_TOKEN = 'test-admin-token';
+    env.SELF = {
+      fetch: vi.fn(async (req: Request) => {
+        const pathname = new URL(req.url).pathname;
+        if (pathname === '/api/v1/internal/scheduled/check-batch') {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              runtime_updates: [
+                {
+                  monitor_id: 1,
+                  interval_sec: 60,
+                  created_at: 1_760_000_001,
+                  checked_at: checkedAt,
+                  check_status: 'degraded',
+                  next_status: 'up',
+                  latency_ms: 12,
+                },
+              ],
+            }),
+            { status: 200 },
+          );
+        }
+        if (pathname === '/api/v1/internal/refresh/homepage') {
+          return new Response(JSON.stringify({ ok: true, refreshed: true }), { status: 200 });
+        }
+        throw new Error(`unexpected self fetch: ${pathname}`);
+      }),
+    } as unknown as Fetcher;
+    const waitUntil = vi.fn();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    try {
+      await runScheduledTick(env, { waitUntil } as unknown as ExecutionContext);
+      await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
+
+      expect(warn).toHaveBeenCalledWith(
+        'scheduled: service batch failed, falling back inline',
+        expect.any(Error),
+      );
+      expect(dispatchWebhookToChannels).toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('logs homepage snapshot refresh failures without breaking the tick', async () => {
