@@ -1581,9 +1581,10 @@ function tryPatchPublicHomepagePayloadFromRuntimeSnapshot(opts: {
   baseSnapshot: PublicHomepageResponse | null;
   runtimeSnapshot: PublicMonitorRuntimeSnapshot | null;
   now: number;
+  updates: MonitorRuntimeUpdate[];
   trace?: Trace;
 }): PublicHomepageResponse | null {
-  const { baseSnapshot, runtimeSnapshot, now } = opts;
+  const { baseSnapshot, runtimeSnapshot, now, updates } = opts;
   if (!baseSnapshot || !runtimeSnapshot || !canPatchHomepageFromRuntime(baseSnapshot)) {
     opts.trace?.setLabel('runtime_snapshot_patch_skip', 'base_ineligible');
     return null;
@@ -1592,11 +1593,7 @@ function tryPatchPublicHomepagePayloadFromRuntimeSnapshot(opts: {
     opts.trace?.setLabel('runtime_snapshot_patch_skip', 'base_stale');
     return null;
   }
-  if (
-    runtimeSnapshot.generated_at < baseSnapshot.generated_at ||
-    runtimeSnapshot.generated_at > now ||
-    runtimeSnapshot.day_start_at !== utcDayStart(now)
-  ) {
+  if (runtimeSnapshot.generated_at > now || runtimeSnapshot.day_start_at !== utcDayStart(now)) {
     opts.trace?.setLabel('runtime_snapshot_patch_skip', 'runtime_window');
     return null;
   }
@@ -1620,6 +1617,31 @@ function tryPatchPublicHomepagePayloadFromRuntimeSnapshot(opts: {
     return null;
   }
 
+  const updateById = new Map<number, MonitorRuntimeUpdate>();
+  for (const update of updates) {
+    if (!Number.isInteger(update.monitor_id) || update.monitor_id <= 0) {
+      opts.trace?.setLabel('runtime_snapshot_patch_skip', 'invalid_update_id');
+      return null;
+    }
+    if (!monitorIds.includes(update.monitor_id)) {
+      opts.trace?.setLabel('runtime_snapshot_patch_skip', 'update_outside_snapshot');
+      return null;
+    }
+    if (!Number.isInteger(update.checked_at) || update.checked_at < update.created_at) {
+      opts.trace?.setLabel('runtime_snapshot_patch_skip', 'invalid_update_window');
+      return null;
+    }
+    if (update.checked_at > now) {
+      opts.trace?.setLabel('runtime_snapshot_patch_skip', 'future_update');
+      return null;
+    }
+    if (updateById.has(update.monitor_id)) {
+      opts.trace?.setLabel('runtime_snapshot_patch_skip', 'duplicate_update');
+      return null;
+    }
+    updateById.set(update.monitor_id, update);
+  }
+
   const rangeEndFullDays = utcDayStart(now);
   const rangeStart = Math.max(now - UPTIME_DAYS * 86400, earliestCreatedAt);
   const todayStartAt = utcDayStart(now);
@@ -1640,62 +1662,154 @@ function tryPatchPublicHomepagePayloadFromRuntimeSnapshot(opts: {
       opts.trace?.setLabel('runtime_snapshot_patch_skip', 'monitor_runtime_missing');
       return null;
     }
-
-    const presentation = computeHomepageMonitorPresentation(
-      {
-        id: baseMonitor.id,
-        interval_sec: runtimeEntry.interval_sec,
-        last_checked_at: runtimeEntry.last_checked_at,
-        state_status: fromRuntimeStatusCode(runtimeEntry.last_status_code),
-      },
-      now,
-      noMaintenanceMonitorIds,
+    const update = updateById.get(baseMonitor.id);
+    const createdAt = update?.created_at ?? runtimeEntry.created_at;
+    const intervalSec = update?.interval_sec ?? runtimeEntry.interval_sec;
+    const todayIndex = baseMonitor.uptime_day_strip.day_start_at.findIndex(
+      (dayStart) => dayStart === todayStartAt,
     );
-    const heartbeats = runtimeEntryToHeartbeats(runtimeEntry);
-    const monitor: HomepageMonitorCard = {
-      ...baseMonitor,
-      status: presentation.status,
-      is_stale: presentation.is_stale,
-      last_checked_at: runtimeEntry.last_checked_at,
-      heartbeat_strip: {
-        checked_at: heartbeats.map((heartbeat) => heartbeat.checked_at),
-        latency_ms: heartbeats.map((heartbeat) => heartbeat.latency_ms),
-        status_codes: heartbeats.map((heartbeat) => toHeartbeatStatusCode(heartbeat.status)).join(''),
-      },
-      uptime_30d: null,
-      uptime_day_strip: {
-        day_start_at: [],
-        downtime_sec: [],
-        unknown_sec: [],
-        uptime_pct_milli: [],
-      },
-    };
+    const currentDowntime =
+      todayIndex < 0 ? 0 : Math.max(0, baseMonitor.uptime_day_strip.downtime_sec[todayIndex] ?? 0);
+    const currentUnknown =
+      todayIndex < 0 ? 0 : Math.max(0, baseMonitor.uptime_day_strip.unknown_sec[todayIndex] ?? 0);
+
+    let nextMonitor: HomepageMonitorCard;
+    let todayTotals: UptimeWindowTotals | null = null;
+    if (update) {
+      if (baseMonitor.last_checked_at !== null && update.checked_at <= baseMonitor.last_checked_at) {
+        opts.trace?.setLabel('runtime_snapshot_patch_skip', 'stale_update');
+        return null;
+      }
+      if (
+        baseMonitor.last_checked_at !== null &&
+        update.checked_at - baseMonitor.last_checked_at >
+          Math.max(
+            HOMEPAGE_FAST_PATCH_BASE_MAX_AGE_SECONDS,
+            update.interval_sec + HOMEPAGE_FAST_PATCH_UPDATE_GRACE_SECONDS,
+          )
+      ) {
+        opts.trace?.setLabel('runtime_snapshot_patch_skip', 'update_gap');
+        return null;
+      }
+
+      const segmentStart = Math.max(todayStartAt, baseSnapshot.generated_at, createdAt);
+      const segmentEnd = Math.max(segmentStart, Math.min(update.checked_at, now));
+      const segment = computePatchedHomepageSegmentTotals({
+        status: baseMonitor.status,
+        isStale: baseMonitor.is_stale,
+        lastCheckedAt: baseMonitor.last_checked_at,
+        intervalSec,
+        segmentStart,
+        segmentEnd,
+      });
+
+      const totalSec = Math.max(0, now - Math.max(todayStartAt, createdAt));
+      const nextDowntimeSec = currentDowntime + segment.downtimeSec;
+      const nextUnknownSec = currentUnknown + segment.unknownSec;
+      const nextUptimeSec = Math.max(0, totalSec - nextDowntimeSec - nextUnknownSec);
+      todayTotals = {
+        total_sec: totalSec,
+        downtime_sec: nextDowntimeSec,
+        unknown_sec: nextUnknownSec,
+        uptime_sec: nextUptimeSec,
+        uptime_pct: totalSec === 0 ? null : (nextUptimeSec / totalSec) * 100,
+      };
+
+      nextMonitor = {
+        ...baseMonitor,
+        last_checked_at: update.checked_at,
+        status: toMonitorStatus(update.next_status) ?? 'unknown',
+        is_stale: false,
+        heartbeat_strip: {
+          checked_at: [
+            update.checked_at,
+            ...baseMonitor.heartbeat_strip.checked_at.slice(0, HEARTBEAT_POINTS - 1),
+          ],
+          latency_ms: [
+            normalizeRuntimeUpdateLatencyMs(update.latency_ms),
+            ...baseMonitor.heartbeat_strip.latency_ms.slice(0, HEARTBEAT_POINTS - 1),
+          ],
+          status_codes: `${toHeartbeatStatusCode(update.check_status)}${baseMonitor.heartbeat_strip.status_codes.slice(0, HEARTBEAT_POINTS - 1)}`,
+        },
+        uptime_30d: null,
+        uptime_day_strip: {
+          day_start_at: [],
+          downtime_sec: [],
+          unknown_sec: [],
+          uptime_pct_milli: [],
+        },
+      };
+    } else {
+      const segmentStart = Math.max(todayStartAt, baseSnapshot.generated_at, createdAt);
+      const segment = computePatchedHomepageSegmentTotals({
+        status: baseMonitor.status,
+        isStale: baseMonitor.is_stale,
+        lastCheckedAt: baseMonitor.last_checked_at,
+        intervalSec,
+        segmentStart,
+        segmentEnd: now,
+      });
+      const totalSec = Math.max(0, now - Math.max(todayStartAt, createdAt));
+      const nextDowntimeSec = currentDowntime + segment.downtimeSec;
+      const nextUnknownSec = currentUnknown + segment.unknownSec;
+      const nextUptimeSec = Math.max(0, totalSec - nextDowntimeSec - nextUnknownSec);
+      todayTotals = {
+        total_sec: totalSec,
+        downtime_sec: nextDowntimeSec,
+        unknown_sec: nextUnknownSec,
+        uptime_sec: nextUptimeSec,
+        uptime_pct: totalSec === 0 ? null : (nextUptimeSec / totalSec) * 100,
+      };
+
+      const presentation = computeHomepageMonitorPresentation(
+        {
+          id: baseMonitor.id,
+          interval_sec: intervalSec,
+          last_checked_at: baseMonitor.last_checked_at,
+          state_status: baseMonitor.status,
+        },
+        now,
+        noMaintenanceMonitorIds,
+      );
+      nextMonitor = {
+        ...baseMonitor,
+        status: presentation.status,
+        is_stale: presentation.is_stale,
+        uptime_30d: null,
+        uptime_day_strip: {
+          day_start_at: [],
+          downtime_sec: [],
+          unknown_sec: [],
+          uptime_pct_milli: [],
+        },
+      };
+    }
 
     const totals = {
       totalSec: 0,
       uptimeSec: 0,
     };
     reuseHistoricalRollupsFromBase({
-      monitor,
+      monitor: nextMonitor,
       baseMonitor,
-      monitorCreatedAt: runtimeEntry.created_at,
+      monitorCreatedAt: createdAt,
       rangeStart,
       rangeEndFullDays,
       todayStartAt,
       totals,
     });
-    if (needsToday) {
-      addUptimeDay(monitor, totals, todayStartAt, materializeMonitorRuntimeTotals(runtimeEntry, now));
+    if (needsToday && todayTotals) {
+      addUptimeDay(nextMonitor, totals, todayStartAt, todayTotals);
     }
-    monitor.uptime_30d =
+    nextMonitor.uptime_30d =
       totals.totalSec === 0
         ? null
         : {
             uptime_pct: (totals.uptimeSec / totals.totalSec) * 100,
           };
 
-    summary[monitor.status] += 1;
-    patchedMonitors.push(monitor);
+    summary[nextMonitor.status] += 1;
+    patchedMonitors.push(nextMonitor);
   }
 
   opts.trace?.setLabel('runtime_snapshot_patch', '1');
@@ -2105,6 +2219,7 @@ export async function tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates
       baseSnapshot,
       runtimeSnapshot,
       now: opts.now,
+      updates: opts.updates,
       ...(opts.trace ? { trace: opts.trace } : {}),
     }),
   );
