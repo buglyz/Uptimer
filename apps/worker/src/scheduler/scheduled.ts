@@ -18,7 +18,7 @@ import type { CheckOutcome } from '../monitor/types';
 import { rebuildPublicMonitorRuntimeSnapshot } from '../public/monitor-runtime-bootstrap';
 import {
   normalizeRuntimeUpdateLatencyMs,
-  monitorRuntimeUpdateSchema,
+  parseMonitorRuntimeUpdate,
   refreshPublicMonitorRuntimeSnapshot,
   type MonitorRuntimeUpdate,
 } from '../public/monitor-runtime';
@@ -248,11 +248,11 @@ function toScheduledCheckBatchServiceResult(value: unknown): ScheduledCheckBatch
   }
 
   const runtimeUpdates: MonitorRuntimeUpdate[] = runtimeUpdatesValue.map((item, index) => {
-    const parsed = monitorRuntimeUpdateSchema.safeParse(item);
-    if (!parsed.success) {
+    const parsed = parseMonitorRuntimeUpdate(item);
+    if (!parsed) {
       throw new Error(`service batch returned invalid runtime update at index ${index}`);
     }
-    return parsed.data;
+    return parsed;
   });
 
   const stats: MonitorBatchStats = {

@@ -71,15 +71,92 @@ export type MonitorRuntimeUpdate = {
   latency_ms: number | null;
 };
 
+type MonitorRuntimeUpdateStatus = Exclude<MonitorRuntimeUpdate['check_status'], null>;
+
 const monitorRuntimeUpdateStatusSchema = z
   .enum(['up', 'down', 'maintenance', 'paused', 'unknown'])
   .nullable();
+const monitorRuntimeUpdateStatusValues = new Set<MonitorRuntimeUpdateStatus>([
+  'up',
+  'down',
+  'maintenance',
+  'paused',
+  'unknown',
+]);
 
 export function normalizeRuntimeUpdateLatencyMs(value: unknown): number | null {
   if (typeof value !== 'number' || !Number.isFinite(value)) {
     return null;
   }
   return Math.max(0, Math.round(value));
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0;
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0;
+}
+
+function parseMonitorRuntimeUpdateStatus(
+  value: unknown,
+): MonitorRuntimeUpdateStatus | null | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === null) {
+    return null;
+  }
+  return monitorRuntimeUpdateStatusValues.has(value as MonitorRuntimeUpdateStatus)
+    ? (value as MonitorRuntimeUpdateStatus)
+    : undefined;
+}
+
+export function parseMonitorRuntimeUpdate(value: unknown): MonitorRuntimeUpdate | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const checkStatus = parseMonitorRuntimeUpdateStatus(value.check_status);
+  const nextStatus = parseMonitorRuntimeUpdateStatus(value.next_status);
+  if (
+    !isPositiveInteger(value.monitor_id) ||
+    !isPositiveInteger(value.interval_sec) ||
+    !isNonNegativeInteger(value.created_at) ||
+    !isNonNegativeInteger(value.checked_at) ||
+    checkStatus === undefined ||
+    nextStatus === undefined
+  ) {
+    return null;
+  }
+
+  return {
+    monitor_id: value.monitor_id,
+    interval_sec: value.interval_sec,
+    created_at: value.created_at,
+    checked_at: value.checked_at,
+    check_status: checkStatus,
+    next_status: nextStatus,
+    latency_ms: normalizeRuntimeUpdateLatencyMs(value.latency_ms),
+  };
+}
+
+export function parseMonitorRuntimeUpdates(value: unknown): MonitorRuntimeUpdate[] | null {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+
+  const updates = new Array<MonitorRuntimeUpdate>(value.length);
+  for (let index = 0; index < value.length; index += 1) {
+    const parsed = parseMonitorRuntimeUpdate(value[index]);
+    if (!parsed) {
+      return null;
+    }
+    updates[index] = parsed;
+  }
+
+  return updates;
 }
 
 export const monitorRuntimeUpdateSchema = z.object({

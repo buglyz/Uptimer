@@ -1533,48 +1533,39 @@ function computePatchedHomepageSegmentTotals(opts: {
   };
 }
 
-function recomputePatchedHomepageUptime30d(opts: {
-  monitor: HomepageMonitorCard;
-  createdAt: number;
-  now: number;
-}): HomepageMonitorCard['uptime_30d'] {
-  const rangeEnd = opts.now;
-  const rangeStart = Math.max(rangeEnd - UPTIME_DAYS * 86400, opts.createdAt);
-  let totalSec = 0;
-  let uptimeSec = 0;
-  const count = Math.min(
-    opts.monitor.uptime_day_strip.day_start_at.length,
-    opts.monitor.uptime_day_strip.downtime_sec.length,
-    opts.monitor.uptime_day_strip.unknown_sec.length,
-  );
+function prependCappedArray<T>(value: T, source: readonly T[], maxLength: number): T[] {
+  const nextLength = Math.min(Math.max(1, maxLength), source.length + 1);
+  const next = new Array<T>(nextLength);
+  next[0] = value;
+  for (let index = 1; index < nextLength; index += 1) {
+    next[index] = source[index - 1] as T;
+  }
+  return next;
+}
 
-  for (let index = 0; index < count; index += 1) {
-    const dayStartAt = opts.monitor.uptime_day_strip.day_start_at[index];
-    if (typeof dayStartAt !== 'number') continue;
-    if (dayStartAt >= rangeEnd || dayStartAt + 86400 <= rangeStart) {
-      continue;
-    }
-
-    const dayTotal = Math.max(
-      0,
-      Math.min(dayStartAt + 86400, rangeEnd) - Math.max(dayStartAt, rangeStart, opts.createdAt),
-    );
-    if (dayTotal === 0) continue;
-
-    totalSec += dayTotal;
-    uptimeSec += Math.max(
-      0,
-      dayTotal -
-        Math.max(0, opts.monitor.uptime_day_strip.downtime_sec[index] ?? 0) -
-        Math.max(0, opts.monitor.uptime_day_strip.unknown_sec[index] ?? 0),
-    );
+function computePatchedHomepageUptimeDayContribution(opts: {
+  dayStartAt: number;
+  rangeStart: number;
+  rangeEnd: number;
+  downtimeSec: number;
+  unknownSec: number;
+}): { totalSec: number; uptimeSec: number } {
+  if (opts.dayStartAt >= opts.rangeEnd || opts.dayStartAt + 86400 <= opts.rangeStart) {
+    return { totalSec: 0, uptimeSec: 0 };
   }
 
-  return totalSec === 0
-    ? null
-    : {
-        uptime_pct: (uptimeSec / totalSec) * 100,
-      };
+  const totalSec = Math.max(
+    0,
+    Math.min(opts.dayStartAt + 86400, opts.rangeEnd) - Math.max(opts.dayStartAt, opts.rangeStart),
+  );
+  if (totalSec === 0) {
+    return { totalSec: 0, uptimeSec: 0 };
+  }
+
+  return {
+    totalSec,
+    uptimeSec: Math.max(0, totalSec - Math.max(0, opts.downtimeSec) - Math.max(0, opts.unknownSec)),
+  };
 }
 
 function tryPatchPublicHomepagePayloadFromRuntimeSnapshot(opts: {
@@ -1901,26 +1892,55 @@ export function tryPatchPublicHomepagePayloadFromRuntimeUpdates(opts: {
       segmentEnd,
     });
 
-    const nextCheckedAt = [
+    const nextCheckedAt = prependCappedArray(
       update.checked_at,
-      ...monitor.heartbeat_strip.checked_at.slice(0, HEARTBEAT_POINTS - 1),
-    ];
-    const nextLatencyMs = [
+      monitor.heartbeat_strip.checked_at,
+      HEARTBEAT_POINTS,
+    );
+    const nextLatencyMs = prependCappedArray(
       normalizeRuntimeUpdateLatencyMs(update.latency_ms),
-      ...monitor.heartbeat_strip.latency_ms.slice(0, HEARTBEAT_POINTS - 1),
-    ];
+      monitor.heartbeat_strip.latency_ms,
+      HEARTBEAT_POINTS,
+    );
     const nextStatusCodes = `${toHeartbeatStatusCode(update.check_status)}${monitor.heartbeat_strip.status_codes.slice(0, HEARTBEAT_POINTS - 1)}`;
 
-    const dayStartAt = [...monitor.uptime_day_strip.day_start_at];
-    const downtimeSec = [...monitor.uptime_day_strip.downtime_sec];
-    const unknownSec = [...monitor.uptime_day_strip.unknown_sec];
-    const uptimePctMilli = [...monitor.uptime_day_strip.uptime_pct_milli];
+    const dayStartAt = monitor.uptime_day_strip.day_start_at.slice();
+    const downtimeSec = monitor.uptime_day_strip.downtime_sec.slice();
+    const unknownSec = monitor.uptime_day_strip.unknown_sec.slice();
+    const uptimePctMilli = monitor.uptime_day_strip.uptime_pct_milli.slice();
+    const rangeStart = Math.max(now - UPTIME_DAYS * 86400, update.created_at);
+    let uptime30dTotalSec = 0;
+    let uptime30dUptimeSec = 0;
+    let bucketIndex = -1;
+    let currentTodayTotalSec = 0;
+    let currentTodayUptimeSec = 0;
 
-    const todayIndex = dayStartAt.findIndex(
-      (dayStart) => dayStart === todayStartAt,
-    );
-    let bucketIndex = todayIndex;
-    if (todayIndex < 0) {
+    for (let index = 0; index < dayStartAt.length; index += 1) {
+      const dayStart = dayStartAt[index];
+      if (typeof dayStart !== 'number') {
+        continue;
+      }
+
+      const currentDowntimeValue = Math.max(0, downtimeSec[index] ?? 0);
+      const currentUnknownValue = Math.max(0, unknownSec[index] ?? 0);
+      const contribution = computePatchedHomepageUptimeDayContribution({
+        dayStartAt: dayStart,
+        rangeStart,
+        rangeEnd: now,
+        downtimeSec: currentDowntimeValue,
+        unknownSec: currentUnknownValue,
+      });
+      uptime30dTotalSec += contribution.totalSec;
+      uptime30dUptimeSec += contribution.uptimeSec;
+
+      if (dayStart === todayStartAt) {
+        bucketIndex = index;
+        currentTodayTotalSec = contribution.totalSec;
+        currentTodayUptimeSec = contribution.uptimeSec;
+      }
+    }
+
+    if (bucketIndex < 0) {
       bucketIndex = dayStartAt.push(todayStartAt) - 1;
       downtimeSec.push(0);
       unknownSec.push(0);
@@ -1938,6 +1958,8 @@ export function tryPatchPublicHomepagePayloadFromRuntimeUpdates(opts: {
     unknownSec[bucketIndex] = nextUnknownSec;
     uptimePctMilli[bucketIndex] =
       totalSec === 0 ? null : Math.round((nextUptimeSec * 100000) / totalSec);
+    uptime30dTotalSec += totalSec - currentTodayTotalSec;
+    uptime30dUptimeSec += nextUptimeSec - currentTodayUptimeSec;
     const nextMonitor: HomepageMonitorCard = {
       ...monitor,
       last_checked_at: update.checked_at,
@@ -1956,11 +1978,12 @@ export function tryPatchPublicHomepagePayloadFromRuntimeUpdates(opts: {
         uptime_pct_milli: uptimePctMilli,
       },
     };
-    nextMonitor.uptime_30d = recomputePatchedHomepageUptime30d({
-      monitor: nextMonitor,
-      createdAt: update.created_at,
-      now,
-    });
+    nextMonitor.uptime_30d =
+      uptime30dTotalSec === 0
+        ? null
+        : {
+            uptime_pct: (uptime30dUptimeSec / uptime30dTotalSec) * 100,
+          };
 
     summary[nextMonitor.status] += 1;
     patchedMonitors.push(nextMonitor);

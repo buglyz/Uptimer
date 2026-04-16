@@ -4,6 +4,8 @@ import {
   applyMonitorRuntimeUpdates,
   materializeMonitorRuntimeTotals,
   monitorRuntimeUpdateSchema,
+  parseMonitorRuntimeUpdate,
+  parseMonitorRuntimeUpdates,
   readPublicMonitorRuntimeSnapshot,
   runtimeEntryToHeartbeats,
   writePublicMonitorRuntimeSnapshot,
@@ -139,6 +141,53 @@ describe('public/monitor-runtime', () => {
         latency_ms: 12,
       }),
     ).toThrow();
+  });
+
+  it('parses runtime updates with the same privileged latency normalization on the hot path', () => {
+    expect(
+      parseMonitorRuntimeUpdate({
+        monitor_id: 1,
+        interval_sec: 60,
+        created_at: 0,
+        checked_at: 60,
+        check_status: 'up',
+        next_status: 'up',
+        latency_ms: -3.7,
+      }),
+    ).toEqual({
+      monitor_id: 1,
+      interval_sec: 60,
+      created_at: 0,
+      checked_at: 60,
+      check_status: 'up',
+      next_status: 'up',
+      latency_ms: 0,
+    });
+  });
+
+  it('rejects invalid runtime update arrays on the hot path', () => {
+    expect(
+      parseMonitorRuntimeUpdates([
+        {
+          monitor_id: 1,
+          interval_sec: 60,
+          created_at: 0,
+          checked_at: 60,
+          check_status: 'up',
+          next_status: 'up',
+          latency_ms: 12,
+        },
+        {
+          monitor_id: 2,
+          interval_sec: 60,
+          created_at: 0,
+          checked_at: 120,
+          check_status: 'degraded',
+          next_status: 'up',
+          latency_ms: 12,
+        },
+      ]),
+    ).toBeNull();
   });
 
   it('ignores out-of-order updates for existing runtime entries', () => {

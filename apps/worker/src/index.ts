@@ -2,7 +2,10 @@ import { z } from 'zod';
 
 import type { Env } from './env';
 import type { Trace } from './observability/trace';
-import { monitorRuntimeUpdateSchema, type MonitorRuntimeUpdate } from './public/monitor-runtime';
+import {
+  parseMonitorRuntimeUpdates,
+  type MonitorRuntimeUpdate,
+} from './public/monitor-runtime';
 import type { CompletedDueMonitor } from './scheduler/scheduled';
 
 const HOMEPAGE_REFRESH_LOCK_NAME = 'snapshot:homepage:refresh';
@@ -57,18 +60,103 @@ function buildInternalRefreshResponse(ok: boolean, refreshed: boolean): Response
 
 const internalRefreshJsonBodySchema = z.object({
   token: z.string().optional(),
-  runtime_updates: z.array(monitorRuntimeUpdateSchema).optional(),
+  runtime_updates: z.array(z.unknown()).optional(),
 });
 
-const internalScheduledCheckBatchJsonBodySchema = z.object({
-  token: z.string().optional(),
-  ids: z.array(z.number().int().positive()).min(1),
-  checked_at: z.number().int().nonnegative(),
-  suppressed_monitor_ids: z.array(z.number().int().positive()).optional(),
-  state_failures_to_down_from_up: z.number().int().min(1).max(10),
-  state_successes_to_up_from_down: z.number().int().min(1).max(10),
-  allow_notifications: z.boolean().optional(),
-});
+type InternalScheduledCheckBatchBody = {
+  token?: string;
+  ids: number[];
+  checked_at: number;
+  suppressed_monitor_ids?: number[];
+  state_failures_to_down_from_up: number;
+  state_successes_to_up_from_down: number;
+  allow_notifications?: boolean;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0;
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0;
+}
+
+function isInternalRefreshBody(
+  value: unknown,
+): value is { token?: string; runtime_updates?: unknown } {
+  return isRecord(value);
+}
+
+function parseInternalRefreshRuntimeUpdates(
+  value: unknown,
+): { runtime_updates?: MonitorRuntimeUpdate[] } | null {
+  if (!isInternalRefreshBody(value)) {
+    return null;
+  }
+  if (value.token !== undefined && typeof value.token !== 'string') {
+    return null;
+  }
+  if (value.runtime_updates === undefined) {
+    return {};
+  }
+
+  const runtimeUpdates = parseMonitorRuntimeUpdates(value.runtime_updates);
+  return runtimeUpdates ? { runtime_updates: runtimeUpdates } : null;
+}
+
+function parseInternalScheduledCheckBatchBody(value: unknown): InternalScheduledCheckBatchBody | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  if (value.token !== undefined && typeof value.token !== 'string') {
+    return null;
+  }
+  if (!Array.isArray(value.ids) || value.ids.length === 0 || !value.ids.every(isPositiveInteger)) {
+    return null;
+  }
+  if (!isNonNegativeInteger(value.checked_at)) {
+    return null;
+  }
+  if (
+    value.suppressed_monitor_ids !== undefined &&
+    (!Array.isArray(value.suppressed_monitor_ids) ||
+      !value.suppressed_monitor_ids.every(isPositiveInteger))
+  ) {
+    return null;
+  }
+  if (
+    !isPositiveInteger(value.state_failures_to_down_from_up) ||
+    value.state_failures_to_down_from_up > 10 ||
+    !isPositiveInteger(value.state_successes_to_up_from_down) ||
+    value.state_successes_to_up_from_down > 10
+  ) {
+    return null;
+  }
+  if (
+    value.allow_notifications !== undefined &&
+    typeof value.allow_notifications !== 'boolean'
+  ) {
+    return null;
+  }
+
+  return {
+    ...(value.token !== undefined ? { token: value.token } : {}),
+    ids: value.ids,
+    checked_at: value.checked_at,
+    ...(value.suppressed_monitor_ids !== undefined
+      ? { suppressed_monitor_ids: value.suppressed_monitor_ids }
+      : {}),
+    state_failures_to_down_from_up: value.state_failures_to_down_from_up,
+    state_successes_to_up_from_down: value.state_successes_to_up_from_down,
+    ...(value.allow_notifications !== undefined
+      ? { allow_notifications: value.allow_notifications }
+      : {}),
+  };
+}
 
 function finalizeInternalRefreshResponse(
   res: Response,
@@ -109,17 +197,32 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
   }
 
   let runtimeUpdates: MonitorRuntimeUpdate[] | undefined;
+  const scheduledRefreshRequest = isScheduledRefreshRequest(request);
   const contentType = request.headers.get('Content-Type') ?? '';
 
   if (contentType.includes('application/json')) {
-    const parsedBody = internalRefreshJsonBodySchema.safeParse(
-      await request.json().catch(() => null),
-    );
-    if (!parsedBody.success) {
+    const rawBody = await request.json().catch(() => null);
+    const parsedBody = scheduledRefreshRequest
+      ? parseInternalRefreshRuntimeUpdates(rawBody)
+      : (() => {
+          const parsed = internalRefreshJsonBodySchema.safeParse(rawBody);
+          if (!parsed.success) {
+            return null;
+          }
+
+          const runtime_updates = parsed.data.runtime_updates;
+          if (runtime_updates === undefined) {
+            return {};
+          }
+
+          const parsedRuntimeUpdates = parseMonitorRuntimeUpdates(runtime_updates);
+          return parsedRuntimeUpdates ? { runtime_updates: parsedRuntimeUpdates } : null;
+        })();
+    if (!parsedBody) {
       return new Response('Forbidden', { status: 403 });
     }
 
-    runtimeUpdates = parsedBody.data.runtime_updates;
+    runtimeUpdates = parsedBody.runtime_updates;
   }
 
   const now = Math.floor(Date.now() / 1000);
@@ -139,7 +242,7 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
     trace.setLabel('now', now);
     trace.setLabel('runtime_updates_count', runtimeUpdates?.length ?? 0);
   }
-  const skipInitialFreshnessCheck = isScheduledRefreshRequest(request);
+  const skipInitialFreshnessCheck = scheduledRefreshRequest;
   if (trace?.enabled && skipInitialFreshnessCheck) {
     trace.setLabel('skip_initial_freshness_check', '1');
   }
@@ -364,27 +467,25 @@ async function handleInternalScheduledCheckBatch(
     return new Response('Payload Too Large', { status: 413 });
   }
 
-  const parsedBody = internalScheduledCheckBatchJsonBodySchema.safeParse(
-    await request.json().catch(() => null),
-  );
-  if (!parsedBody.success) {
+  const parsedBody = parseInternalScheduledCheckBatchBody(await request.json().catch(() => null));
+  if (!parsedBody) {
     return new Response('Forbidden', { status: 403 });
   }
   const now = Math.floor(Date.now() / 1000);
   const currentCheckedAt = Math.floor(now / 60) * 60;
   if (
-    parsedBody.data.checked_at > currentCheckedAt ||
-    parsedBody.data.checked_at < currentCheckedAt - 60
+    parsedBody.checked_at > currentCheckedAt ||
+    parsedBody.checked_at < currentCheckedAt - 60
   ) {
     return new Response('Forbidden', { status: 403 });
   }
 
-  const ids = [...new Set(parsedBody.data.ids)];
-  const suppressedMonitorIds = new Set(parsedBody.data.suppressed_monitor_ids ?? []);
+  const ids = [...new Set(parsedBody.ids)];
+  const suppressedMonitorIds = new Set(parsedBody.suppressed_monitor_ids ?? []);
   const [{ listMonitorRowsByIds, runPersistedMonitorBatch }, notificationsModule] =
     await Promise.all([
       import('./scheduler/scheduled'),
-      parsedBody.data.allow_notifications === true
+      parsedBody.allow_notifications === true
         ? import('./scheduler/notifications')
         : Promise.resolve(null),
     ]);
@@ -394,7 +495,7 @@ async function handleInternalScheduledCheckBatch(
   const rows = ids
     .map((id) => rowById.get(id) ?? null)
     .filter((row): row is NonNullable<typeof row> => row !== null)
-    .filter((row) => row.last_checked_at === null || row.last_checked_at < parsedBody.data.checked_at);
+    .filter((row) => row.last_checked_at === null || row.last_checked_at < parsedBody.checked_at);
 
   const notify = notificationsModule
     ? await notificationsModule.createNotifyContext(env, ctx)
@@ -402,11 +503,11 @@ async function handleInternalScheduledCheckBatch(
   const result = await runPersistedMonitorBatch({
     db: env.DB,
     rows,
-    checkedAt: parsedBody.data.checked_at,
+    checkedAt: parsedBody.checked_at,
     suppressedMonitorIds,
     stateMachineConfig: {
-      failuresToDownFromUp: parsedBody.data.state_failures_to_down_from_up,
-      successesToUpFromDown: parsedBody.data.state_successes_to_up_from_down,
+      failuresToDownFromUp: parsedBody.state_failures_to_down_from_up,
+      successesToUpFromDown: parsedBody.state_successes_to_up_from_down,
     },
     ...(notificationsModule && notify
       ? {
