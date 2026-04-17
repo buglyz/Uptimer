@@ -1,8 +1,7 @@
 import {
-  publicStatusResponseSchema,
-  storedPublicStatusResponseSchema,
   type PublicStatusResponse,
 } from '../schemas/public-status';
+import { storedPublicStatusResponseSchema } from '../schemas/public-status-stored';
 
 const SNAPSHOT_KEY = 'status';
 const MAX_AGE_SECONDS = 60;
@@ -65,12 +64,7 @@ function parseJsonText(text: string): ParsedJsonText | null {
 
 function normalizeStatusSnapshotPayload(value: unknown): PublicStatusResponse | null {
   const stored = storedPublicStatusResponseSchema.safeParse(value);
-  if (stored.success) {
-    return stored.data;
-  }
-
-  const parsed = publicStatusResponseSchema.safeParse(value);
-  return parsed.success ? parsed.data : null;
+  return stored.success ? stored.data : null;
 }
 
 function validateStatusSnapshotBodyJson(bodyJson: string): ValidatedStatusSnapshotJson | null {
