@@ -390,7 +390,7 @@ function finalizeInternalRefreshResponse(
   traceMod: typeof import('./observability/trace') | null,
   info: { refreshed?: boolean; error?: boolean },
 ): Response {
-  if (!trace || !traceMod) {
+  if (!trace?.enabled || !traceMod) {
     return res;
   }
 

@@ -123,8 +123,11 @@ function createEnv(now: number): Env {
 }
 
 describe('internal homepage refresh route', () => {
+  let consoleLogSpy: ReturnType<typeof vi.spyOn>;
+
   beforeEach(() => {
     vi.restoreAllMocks();
+    consoleLogSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
     vi.mocked(acquireLease).mockResolvedValue(true);
     vi.mocked(releaseLease).mockResolvedValue(undefined);
     vi.mocked(renewLease).mockResolvedValue(true);
@@ -907,5 +910,50 @@ describe('internal homepage refresh route', () => {
     expect(res.status).toBe(200);
     expect(res.headers.get('X-Uptimer-Trace')).toBeNull();
     expect(res.headers.get('X-Uptimer-Trace-Id')).toBeNull();
+    expect(consoleLogSpy).not.toHaveBeenCalledWith(expect.stringContaining('internal-refresh:'));
+  });
+
+  it('emits internal refresh trace labels when the trace token matches', async () => {
+    const now = 1_776_230_340;
+    vi.spyOn(Date, 'now').mockReturnValue(now * 1000);
+    const env = createEnv(now);
+    (env as unknown as Record<string, unknown>).UPTIMER_TRACE_TOKEN = 'expected-token';
+    const baseSnapshot = createBaseSnapshot(now);
+    vi.mocked(tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates).mockResolvedValue(
+      {
+        ...baseSnapshot,
+        generated_at: now,
+      } as never,
+    );
+
+    const res = await worker.fetch(
+      new Request('http://internal/api/v1/internal/refresh/homepage', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer test-admin-token',
+          'Content-Type': 'application/json; charset=utf-8',
+          'X-Uptimer-Trace': '1',
+          'X-Uptimer-Trace-Id': 'trace-123',
+          'X-Uptimer-Trace-Token': 'expected-token',
+          'X-Uptimer-Trace-Mode': 'scheduled',
+          'X-Uptimer-Refresh-Source': 'scheduled',
+        },
+        body: JSON.stringify({
+          token: 'test-admin-token',
+          runtime_updates: [[1, 60, now - 300, now, 'up', 'up', 55]],
+        }),
+      }),
+      env,
+      { waitUntil: vi.fn() } as unknown as ExecutionContext,
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('X-Uptimer-Trace-Id')).toBe('trace-123');
+    expect(res.headers.get('X-Uptimer-Trace')).toContain('route=internal/homepage-refresh');
+    expect(res.headers.get('X-Uptimer-Trace')).toContain('runtime_updates_fast_path_count=1');
+    expect(res.headers.get('X-Uptimer-Trace')).toContain('skip_initial_freshness_check=1');
+    expect(res.headers.get('X-Uptimer-Trace')).toContain('fast_path=scheduled_runtime');
+    expect(res.headers.get('Server-Timing')).toContain('w_total');
+    expect(consoleLogSpy).toHaveBeenCalledWith(expect.stringContaining('internal-refresh:'));
   });
 });
