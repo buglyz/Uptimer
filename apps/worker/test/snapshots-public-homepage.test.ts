@@ -235,7 +235,7 @@ describe('snapshots/public-homepage', () => {
     warn.mockRestore();
   });
 
-  it('writes normalized homepage snapshots with upsert semantics', async () => {
+  it('writes normalized homepage snapshots through the artifact row', async () => {
     const boundArgs: unknown[][] = [];
     const db = createFakeD1Database([
       {
@@ -253,17 +253,7 @@ describe('snapshots/public-homepage', () => {
     const storedRender = buildHomepageRenderArtifact(payload);
 
     expect(boundArgs).toEqual([
-      [
-        'homepage',
-        280,
-        JSON.stringify(payload),
-        300,
-        'homepage:artifact',
-        280,
-        JSON.stringify(storedRender),
-        300,
-        360,
-      ],
+      ['homepage:artifact', 280, JSON.stringify(storedRender), 300, 360],
     ]);
   });
 
@@ -273,10 +263,7 @@ describe('snapshots/public-homepage', () => {
       {
         match: 'insert into public_snapshots',
         run: (args) => {
-          const pairs = [
-            args.slice(0, 4),
-            args.slice(4, 8),
-          ] as [string, number, string, number][];
+          const pairs = [args.slice(0, 4)] as [string, number, string, number][];
           for (const [key, generatedAt, bodyJson, updatedAt] of pairs) {
             const existing = rows.get(key);
             if (!existing || generatedAt >= existing.generated_at) {
@@ -298,6 +285,7 @@ describe('snapshots/public-homepage', () => {
     await writeHomepageSnapshot(db, 300, newerPayload);
     await writeHomepageSnapshot(db, 320, olderPayload);
 
+    expect(rows.get('homepage')).toBeUndefined();
     expect(rows.get('homepage:artifact')?.generated_at).toBe(300);
     expect(rows.get('homepage:artifact')?.body_json).toBe(
       JSON.stringify(buildHomepageRenderArtifact(newerPayload)),
@@ -310,11 +298,8 @@ describe('snapshots/public-homepage', () => {
       {
         match: 'insert into public_snapshots',
         run: (args) => {
-          const futureCutoffAt = Number(args[8] ?? 0);
-          const pairs = [
-            args.slice(0, 4),
-            args.slice(4, 8),
-          ] as [string, number, string, number][];
+          const futureCutoffAt = Number(args[4] ?? 0);
+          const pairs = [args.slice(0, 4)] as [string, number, string, number][];
           for (const [key, generatedAt, bodyJson, updatedAt] of pairs) {
             const existing = rows.get(key);
             if (
@@ -340,8 +325,7 @@ describe('snapshots/public-homepage', () => {
     await writeHomepageSnapshot(db, 900, futurePayload);
     await writeHomepageSnapshot(db, 320, currentPayload);
 
-    expect(rows.get('homepage')?.generated_at).toBe(300);
-    expect(rows.get('homepage')?.body_json).toBe(JSON.stringify(currentPayload));
+    expect(rows.get('homepage')).toBeUndefined();
     expect(rows.get('homepage:artifact')?.generated_at).toBe(300);
     expect(rows.get('homepage:artifact')?.body_json).toBe(
       JSON.stringify(buildHomepageRenderArtifact(currentPayload)),
@@ -354,11 +338,8 @@ describe('snapshots/public-homepage', () => {
       {
         match: 'insert into public_snapshots',
         run: (args) => {
-          const futureCutoffAt = Number(args[8] ?? 0);
-          const pairs = [
-            args.slice(0, 4),
-            args.slice(4, 8),
-          ] as [string, number, string, number][];
+          const futureCutoffAt = Number(args[4] ?? 0);
+          const pairs = [args.slice(0, 4)] as [string, number, string, number][];
           for (const [key, generatedAt, bodyJson, updatedAt] of pairs) {
             const existing = rows.get(key);
             if (
@@ -384,15 +365,14 @@ describe('snapshots/public-homepage', () => {
     await writeHomepageSnapshot(db, 430, newerPayload);
     await writeHomepageSnapshot(db, 435, olderPayload);
 
-    expect(rows.get('homepage')?.generated_at).toBe(421);
-    expect(rows.get('homepage')?.body_json).toBe(JSON.stringify(newerPayload));
+    expect(rows.get('homepage')).toBeUndefined();
     expect(rows.get('homepage:artifact')?.generated_at).toBe(421);
     expect(rows.get('homepage:artifact')?.body_json).toBe(
       JSON.stringify(buildHomepageRenderArtifact(newerPayload)),
     );
   });
 
-  it('continues writing the compact homepage payload row when requested', async () => {
+  it('serves homepage payload JSON from artifact-only snapshot writes', async () => {
     const boundArgs: unknown[][] = [];
     const db = createFakeD1Database([
       {
@@ -408,18 +388,25 @@ describe('snapshots/public-homepage', () => {
     await writeHomepageSnapshot(db, 300, payload, undefined, true);
 
     expect(boundArgs).toEqual([
-      [
-        'homepage',
-        280,
-        JSON.stringify(payload),
-        300,
-        'homepage:artifact',
-        280,
-        JSON.stringify(buildHomepageRenderArtifact(payload)),
-        300,
-        360,
-      ],
+      ['homepage:artifact', 280, JSON.stringify(buildHomepageRenderArtifact(payload)), 300, 360],
     ]);
+
+    const readDb = createFakeD1Database([
+      {
+        match: 'from public_snapshots',
+        first: (args) =>
+          args[0] === 'homepage:artifact'
+            ? {
+                generated_at: 280,
+                body_json: boundArgs[0]?.[2],
+              }
+            : null,
+      },
+    ]);
+    await expect(readHomepageSnapshotJsonAnyAge(readDb, 300)).resolves.toEqual({
+      bodyJson: JSON.stringify(payload),
+      age: 20,
+    });
   });
 
   it('writes artifact-only homepage snapshots without touching the full payload row', async () => {
@@ -537,17 +524,7 @@ describe('snapshots/public-homepage', () => {
     expect(releaseLease).toHaveBeenCalledWith(db, 'snapshot:homepage:refresh', now + 55);
     expect(compute).toHaveBeenCalledTimes(1);
     expect(writtenArgs).toEqual([
-      [
-        'homepage',
-        now,
-        JSON.stringify(samplePayload(now)),
-        now,
-        'homepage:artifact',
-        now,
-        JSON.stringify(storedRender),
-        now,
-        now + 60,
-      ],
+      ['homepage:artifact', now, JSON.stringify(storedRender), now, now + 60],
     ]);
   });
 
@@ -588,17 +565,7 @@ describe('snapshots/public-homepage', () => {
     expect(compute).toHaveBeenCalledTimes(1);
     expect(releaseLease).toHaveBeenCalledWith(db, 'snapshot:homepage:refresh', now + 55);
     expect(writtenArgs).toEqual([
-      [
-        'homepage',
-        now,
-        JSON.stringify(payload),
-        now,
-        'homepage:artifact',
-        now,
-        JSON.stringify(buildHomepageRenderArtifact(payload)),
-        now,
-        now + 60,
-      ],
+      ['homepage:artifact', now, JSON.stringify(buildHomepageRenderArtifact(payload)), now, now + 60],
     ]);
   });
 
