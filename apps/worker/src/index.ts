@@ -759,13 +759,24 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
           snapshotMod.toHomepageSnapshotPayload(payload),
         )
       : snapshotMod.toHomepageSnapshotPayload(payload);
-    const statusBaseSnapshot = trace
-      ? await trace.timeAsync(
-          'status_refresh_read_base_snapshot',
-          async () =>
-            await statusSnapshotReadMod.readStatusSnapshotPayloadAnyAge(env.DB, now),
-        )
-      : await statusSnapshotReadMod.readStatusSnapshotPayloadAnyAge(env.DB, now);
+    const cachedStatusBaseSnapshot = statusSnapshotReadMod.readCachedStatusSnapshotPayloadAnyAge(
+      env.DB,
+      now,
+    );
+    if (trace?.enabled && cachedStatusBaseSnapshot) {
+      trace.setLabel('status_base_snapshot', 'memory_cache');
+    }
+    const statusBaseSnapshot = cachedStatusBaseSnapshot
+      ? cachedStatusBaseSnapshot
+      : trace
+        ? await trace.timeAsync(
+            'status_refresh_read_base_snapshot',
+            async () => await statusSnapshotReadMod.readStatusSnapshotPayloadAnyAge(env.DB, now),
+          )
+        : await statusSnapshotReadMod.readStatusSnapshotPayloadAnyAge(env.DB, now);
+    if (trace?.enabled && !cachedStatusBaseSnapshot && statusBaseSnapshot) {
+      trace.setLabel('status_base_snapshot', 'd1');
+    }
     const statusRefreshArgs = statusFastGuardState
       ? {
           db: env.DB,

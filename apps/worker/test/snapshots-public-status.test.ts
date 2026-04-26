@@ -14,6 +14,7 @@ import {
 } from '../src/snapshots/public-status';
 import {
   readStatusSnapshotJson as readStatusSnapshotJsonFastPath,
+  readCachedStatusSnapshotPayloadAnyAge,
   readStatusSnapshotPayloadAnyAge,
   readStaleStatusSnapshotJson,
 } from '../src/snapshots/public-status-read';
@@ -240,6 +241,26 @@ describe('snapshots/public-status', () => {
     await writeStatusSnapshot(db, now, payload);
 
     expect(boundArgs).toEqual(['status', 280, JSON.stringify(payload), now, now + 60]);
+  });
+
+  it('exposes only fresh validated status snapshots from the in-memory cache', async () => {
+    const db = createFakeD1Database([
+      {
+        match: 'insert into public_snapshots',
+        run: () => ({ meta: { changes: 1 } }),
+      },
+    ]);
+
+    const payload = samplePayload(280);
+    await writeStatusSnapshot(db, 300, payload);
+
+    expect(readCachedStatusSnapshotPayloadAnyAge(db, 320)).toEqual({
+      data: payload,
+      bodyJson: JSON.stringify(payload),
+      age: 40,
+    });
+    expect(readCachedStatusSnapshotPayloadAnyAge(db, 941)).toBeNull();
+    expect(readCachedStatusSnapshotPayloadAnyAge(db, 200)).toBeNull();
   });
 
   it('prepares conditional status writes tied to the homepage artifact write', async () => {

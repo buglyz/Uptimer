@@ -197,6 +197,21 @@ export async function readStatusSnapshotPayloadAnyAge(
   }
 }
 
+export function readCachedStatusSnapshotPayloadAnyAge(
+  db: D1Database,
+  now: number,
+  maxAgeSeconds = MAX_STALE_SECONDS,
+): { data: PublicStatusResponse; bodyJson: string; age: number } | null {
+  const cached = normalizedStatusCacheByDb.get(db);
+  if (!cached) return null;
+  if (cached.generatedAt > now + FUTURE_SNAPSHOT_TOLERANCE_SECONDS) return null;
+
+  const age = Math.max(0, now - cached.generatedAt);
+  if (age > maxAgeSeconds) return null;
+
+  return { data: cached.data, bodyJson: cached.bodyJson, age };
+}
+
 export async function readStaleStatusSnapshotJson(
   db: D1Database,
   now: number,
