@@ -1,5 +1,6 @@
 import type { Env } from '../env';
 import type { Trace } from '../observability/trace';
+import type { PublicStatusResponse } from '../schemas/public-status';
 import { LeaseLostError, startRenewableLease } from '../scheduler/lease-guard';
 import {
   fromRuntimeStatusCode,
@@ -444,36 +445,45 @@ export async function runInternalHomepageRefreshCore({
       });
     }
 
-    const [homepageMod, snapshotMod, statusMod, statusSnapshotMod, statusSnapshotReadMod] =
-      await Promise.all([
-        trace
-          ? trace.timeAsync('import_homepage_module', async () => await import('../public/homepage'))
-          : import('../public/homepage'),
-        trace
-          ? trace.timeAsync(
-              'import_homepage_snapshot_module',
-              async () => await import('../snapshots/public-homepage'),
-            )
-          : import('../snapshots/public-homepage'),
-        trace
-          ? trace.timeAsync(
-              'import_status_refresh_module',
-              async () => await import('../public/status-refresh'),
-            )
-          : import('../public/status-refresh'),
-        trace
-          ? trace.timeAsync(
-              'import_status_snapshot_module',
-              async () => await import('../snapshots/public-status'),
-            )
-          : import('../snapshots/public-status'),
-        trace
-          ? trace.timeAsync(
-              'import_status_snapshot_read_module',
-              async () => await import('../snapshots/public-status-read'),
-            )
-          : import('../snapshots/public-status-read'),
-      ]);
+    const shouldRefreshStatusSnapshot = normalizeInternalTruthy(
+      env.UPTIMER_SCHEDULED_STATUS_REFRESH ?? '1',
+    );
+    const [homepageMod, snapshotMod, statusModules] = await Promise.all([
+      trace
+        ? trace.timeAsync('import_homepage_module', async () => await import('../public/homepage'))
+        : import('../public/homepage'),
+      trace
+        ? trace.timeAsync(
+            'import_homepage_snapshot_module',
+            async () => await import('../snapshots/public-homepage'),
+          )
+        : import('../snapshots/public-homepage'),
+      shouldRefreshStatusSnapshot
+        ? Promise.all([
+            trace
+              ? trace.timeAsync(
+                  'import_status_refresh_module',
+                  async () => await import('../public/status-refresh'),
+                )
+              : import('../public/status-refresh'),
+            trace
+              ? trace.timeAsync(
+                  'import_status_snapshot_module',
+                  async () => await import('../snapshots/public-status'),
+                )
+              : import('../snapshots/public-status'),
+            trace
+              ? trace.timeAsync(
+                  'import_status_snapshot_read_module',
+                  async () => await import('../snapshots/public-status-read'),
+                )
+              : import('../snapshots/public-status-read'),
+          ])
+        : Promise.resolve(null),
+    ]);
+    const statusMod = statusModules?.[0] ?? null;
+    const statusSnapshotMod = statusModules?.[1] ?? null;
+    const statusSnapshotReadMod = statusModules?.[2] ?? null;
 
     let statusFastGuardState:
       | {
@@ -571,13 +581,8 @@ export async function runInternalHomepageRefreshCore({
       ? trace.time('homepage_refresh_validate', () => snapshotMod.toHomepageSnapshotPayload(payload))
       : snapshotMod.toHomepageSnapshotPayload(payload);
 
-    const shouldRefreshStatusSnapshot = normalizeInternalTruthy(
-      env.UPTIMER_SCHEDULED_STATUS_REFRESH ?? '1',
-    );
-    let refreshedStatusPayload: Awaited<
-      ReturnType<typeof statusMod.tryComputePublicStatusPayloadFromScheduledRuntimeUpdates>
-    > | null = null;
-    if (shouldRefreshStatusSnapshot) {
+    let refreshedStatusPayload: PublicStatusResponse | null = null;
+    if (shouldRefreshStatusSnapshot && statusMod && statusSnapshotReadMod) {
       const cachedStatusBaseSnapshot = statusSnapshotReadMod.readCachedStatusSnapshotPayloadAnyAge(
         env.DB,
         now,
@@ -650,7 +655,7 @@ export async function runInternalHomepageRefreshCore({
         homepageWriteLease,
         shouldWriteHomepagePayloadSnapshot,
       );
-      const preparedStatusWrite = refreshedStatusPayload
+      const preparedStatusWrite = refreshedStatusPayload && statusSnapshotMod
         ? statusSnapshotMod.prepareStatusSnapshotWrite({
             db: env.DB,
             now,
@@ -698,7 +703,7 @@ export async function runInternalHomepageRefreshCore({
       }
       const homepageSnapshotWritten = snapshotMod.didApplyHomepageSnapshotWrite(homepageWriteResult);
       const statusWriteResult = writeResults[homepageWriteStatements.length];
-      const statusSnapshotWritten = refreshedStatusPayload
+      const statusSnapshotWritten = refreshedStatusPayload && statusSnapshotMod
         ? statusSnapshotMod.didApplyStatusSnapshotWrite(statusWriteResult)
         : false;
       return { homepageSnapshotWritten, statusSnapshotWritten };
