@@ -293,8 +293,11 @@ export async function runInternalHomepageRefreshCore({
     trace.setLabel('runtime_updates_count', runtimeUpdates?.length ?? 0);
   }
 
+  const trustScheduledRuntimeUpdates = normalizeInternalTruthy(
+    env.UPTIMER_TRUST_SCHEDULED_RUNTIME_UPDATES ?? null,
+  );
   const fastPathRuntimeUpdates =
-    scheduledRefreshRequest && runtimeUpdates
+    scheduledRefreshRequest && runtimeUpdates && !trustScheduledRuntimeUpdates
       ? detailTrace
         ? await detailTrace.timeAsync(
             'homepage_refresh_sanitize_runtime_updates',
@@ -320,6 +323,9 @@ export async function runInternalHomepageRefreshCore({
           })
       : (runtimeUpdates ?? []);
   if (trace?.enabled) {
+    if (scheduledRefreshRequest && runtimeUpdates && trustScheduledRuntimeUpdates) {
+      trace.setLabel('runtime_updates_baseline', 'trusted_request');
+    }
     trace.setLabel('runtime_updates_fast_path_count', fastPathRuntimeUpdates.length);
   }
 

@@ -1102,6 +1102,82 @@ describe('internal homepage refresh route', () => {
     expect(computePublicHomepagePayload).toHaveBeenCalledTimes(1);
   });
 
+  it('trusts scheduled runtime updates when the sanitizer bypass flag is enabled', async () => {
+    const now = 1_776_230_340;
+    vi.spyOn(Date, 'now').mockReturnValue(now * 1000);
+    const baseSnapshot = createBaseSnapshot(now);
+    const env = {
+      DB: createFakeD1Database([
+        {
+          match: 'select key, generated_at, updated_at, body_json from public_snapshots',
+          all: () => [
+            {
+              key: 'homepage',
+              generated_at: baseSnapshot.generated_at,
+              updated_at: baseSnapshot.generated_at,
+              body_json: JSON.stringify(baseSnapshot),
+            },
+          ],
+        },
+        {
+          match: 'select generated_at, updated_at, body_json from public_snapshots',
+          first: () => null,
+        },
+      ]),
+      ADMIN_TOKEN: 'test-admin-token',
+      UPTIMER_TRUST_SCHEDULED_RUNTIME_UPDATES: '1',
+    } as unknown as Env;
+    const fastPayload = {
+      ...baseSnapshot,
+      generated_at: now,
+      monitors: [
+        {
+          ...baseSnapshot.monitors[0]!,
+          last_checked_at: now,
+        },
+      ],
+    };
+    vi.mocked(tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates).mockResolvedValue(
+      fastPayload as never,
+    );
+
+    const res = await worker.fetch(
+      new Request('http://internal/api/v1/internal/refresh/homepage', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer test-admin-token',
+          'Content-Type': 'application/json; charset=utf-8',
+          'X-Uptimer-Refresh-Source': 'scheduled',
+        },
+        body: JSON.stringify({
+          token: 'test-admin-token',
+          runtime_updates: [[1, 60, now - 300, now, 'up', 'up', 55]],
+        }),
+      }),
+      env,
+      { waitUntil: vi.fn() } as unknown as ExecutionContext,
+    );
+
+    expect(res.status).toBe(200);
+    expect(tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates).toHaveBeenCalledWith(
+      expect.objectContaining({
+        updates: [
+          {
+            monitor_id: 1,
+            interval_sec: 60,
+            created_at: now - 300,
+            checked_at: now,
+            check_status: 'up',
+            next_status: 'up',
+            latency_ms: 55,
+          },
+        ],
+      }),
+    );
+    expect(computePublicHomepagePayload).not.toHaveBeenCalled();
+    expect(prepareHomepageSnapshotWrite).toHaveBeenCalledTimes(1);
+  });
+
   it('does not skip a fresh scheduled refresh when runtime updates cannot use the fast path', async () => {
     const now = 1_776_230_340;
     vi.spyOn(Date, 'now').mockReturnValue(now * 1000);
