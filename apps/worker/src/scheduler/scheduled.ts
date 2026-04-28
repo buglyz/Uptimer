@@ -41,6 +41,8 @@ const INTERNAL_SCHEDULED_BATCH_SIZE = 6;
 const INTERNAL_SCHEDULED_BATCH_CONCURRENCY = 2;
 const HOMEPAGE_REFRESH_SERVICE_TIMEOUT_MS = 15_000;
 const RUNTIME_FRAGMENTS_REFRESH_SERVICE_TIMEOUT_MS = 15_000;
+const SHARDED_PUBLIC_SNAPSHOT_SERVICE_TIMEOUT_MS = 15_000;
+const SHARDED_FRAGMENT_SEED_BATCH_SIZE = 5;
 const INTERNAL_SCHEDULED_CHECK_BATCH_TIMEOUT_MS = 30_000;
 const BATCH_EXECUTION_LOCK_PREFIX = 'scheduler:batch:';
 const MONITOR_EXECUTION_LOCK_PREFIX = 'scheduler:batch-monitor:';
@@ -170,6 +172,24 @@ function shouldUseScheduledRuntimeFragmentPipeline(env: Env): boolean {
   );
 }
 
+function shouldSeedScheduledShardedFragments(env: Env): boolean {
+  const rawEnv = env as unknown as Record<string, unknown>;
+  return (
+    Boolean(env.SELF) &&
+    isTruthyEnvFlag(rawEnv.UPTIMER_PUBLIC_SHARDED_FRAGMENT_SEED) &&
+    isTruthyEnvFlag(rawEnv.UPTIMER_SCHEDULED_SHARDED_FRAGMENT_SEED)
+  );
+}
+
+function shouldAssembleScheduledShardedSnapshots(env: Env): boolean {
+  const rawEnv = env as unknown as Record<string, unknown>;
+  return (
+    Boolean(env.SELF) &&
+    isTruthyEnvFlag(rawEnv.UPTIMER_PUBLIC_SHARDED_ASSEMBLER) &&
+    isTruthyEnvFlag(rawEnv.UPTIMER_SCHEDULED_SHARDED_ASSEMBLER)
+  );
+}
+
 function readBoundedPositiveIntegerEnv(
   env: Env,
   key: string,
@@ -255,6 +275,177 @@ async function refreshRuntimeFragmentsViaService(env: Env): Promise<void> {
   console.log(
     `scheduled: runtime_fragments_refresh route=internal/refresh/runtime-fragments refreshed=${refreshed === null ? '-' : refreshed ? 1 : 0} update_count=${updateCount ?? '-'}`,
   );
+}
+
+type ShardedPublicSnapshotKind = 'homepage' | 'status';
+type ShardedPublicSnapshotSeedPart = 'envelope' | 'monitors';
+
+type ShardedPublicSnapshotSeedServiceResult = {
+  seeded: boolean | null;
+  monitorCount: number | null;
+  writeCount: number | null;
+  skipped: string | null;
+};
+
+type ShardedPublicSnapshotAssembleServiceResult = {
+  assembled: boolean | null;
+  monitorCount: number | null;
+  invalidCount: number | null;
+  staleCount: number | null;
+  skip: string | null;
+};
+
+function parseJsonObject(text: string): Record<string, unknown> | null {
+  if (!text) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+async function seedShardedPublicSnapshotPartViaService(
+  env: Env,
+  kind: ShardedPublicSnapshotKind,
+  part: ShardedPublicSnapshotSeedPart,
+  monitorOffset: number,
+  monitorLimit: number,
+): Promise<ShardedPublicSnapshotSeedServiceResult> {
+  if (!env.ADMIN_TOKEN) {
+    throw new Error('ADMIN_TOKEN missing');
+  }
+
+  const res = await fetchSelfWithTimeout(
+    env,
+    new Request('http://internal/api/v1/internal/seed/sharded-public-snapshot', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${env.ADMIN_TOKEN}`,
+        'Content-Type': 'application/json; charset=utf-8',
+      },
+      body: JSON.stringify({
+        kind,
+        part,
+        monitor_offset: monitorOffset,
+        monitor_limit: monitorLimit,
+      }),
+    }),
+    SHARDED_PUBLIC_SNAPSHOT_SERVICE_TIMEOUT_MS,
+    'sharded public snapshot seed service',
+  );
+  const bodyText = await res.text().catch(() => '');
+  if (!res.ok) {
+    throw new Error(`sharded public snapshot seed failed: HTTP ${res.status} ${bodyText}`.trim());
+  }
+
+  const parsed = parseJsonObject(bodyText);
+  return {
+    seeded: typeof parsed?.seeded === 'boolean' ? parsed.seeded : null,
+    monitorCount: typeof parsed?.monitor_count === 'number' ? parsed.monitor_count : null,
+    writeCount: typeof parsed?.write_count === 'number' ? parsed.write_count : null,
+    skipped: typeof parsed?.skipped === 'string' ? parsed.skipped : null,
+  };
+}
+
+async function assembleShardedPublicSnapshotViaService(
+  env: Env,
+  kind: ShardedPublicSnapshotKind,
+): Promise<ShardedPublicSnapshotAssembleServiceResult> {
+  if (!env.ADMIN_TOKEN) {
+    throw new Error('ADMIN_TOKEN missing');
+  }
+
+  const res = await fetchSelfWithTimeout(
+    env,
+    new Request('http://internal/api/v1/internal/assemble/sharded-public-snapshot', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${env.ADMIN_TOKEN}`,
+        'Content-Type': 'application/json; charset=utf-8',
+      },
+      body: JSON.stringify({ kind }),
+    }),
+    SHARDED_PUBLIC_SNAPSHOT_SERVICE_TIMEOUT_MS,
+    'sharded public snapshot assemble service',
+  );
+  const bodyText = await res.text().catch(() => '');
+  if (!res.ok) {
+    throw new Error(`sharded public snapshot assemble failed: HTTP ${res.status} ${bodyText}`.trim());
+  }
+
+  const parsed = parseJsonObject(bodyText);
+  return {
+    assembled: typeof parsed?.assembled === 'boolean' ? parsed.assembled : null,
+    monitorCount: typeof parsed?.monitor_count === 'number' ? parsed.monitor_count : null,
+    invalidCount: typeof parsed?.invalid_count === 'number' ? parsed.invalid_count : null,
+    staleCount: typeof parsed?.stale_count === 'number' ? parsed.stale_count : null,
+    skip: typeof parsed?.skip === 'string' ? parsed.skip : null,
+  };
+}
+
+async function seedShardedPublicSnapshotKindViaService(
+  env: Env,
+  kind: ShardedPublicSnapshotKind,
+  monitorLimit: number,
+): Promise<void> {
+  const envelope = await seedShardedPublicSnapshotPartViaService(
+    env,
+    kind,
+    'envelope',
+    0,
+    monitorLimit,
+  );
+  const monitorCount = envelope.monitorCount ?? 0;
+  let monitorBatchCount = 0;
+  let writeCount = envelope.writeCount ?? 0;
+  for (let offset = 0; offset < monitorCount; offset += monitorLimit) {
+    const batch = await seedShardedPublicSnapshotPartViaService(
+      env,
+      kind,
+      'monitors',
+      offset,
+      monitorLimit,
+    );
+    monitorBatchCount += 1;
+    writeCount += batch.writeCount ?? 0;
+  }
+  console.log(
+    `scheduled: sharded_fragment_seed kind=${kind} monitor_count=${monitorCount} monitor_batches=${monitorBatchCount} write_count=${writeCount} envelope_seeded=${envelope.seeded === null ? '-' : envelope.seeded ? 1 : 0}`,
+  );
+}
+
+async function runScheduledShardedPublicSnapshotWork(env: Env): Promise<void> {
+  const shouldSeed = shouldSeedScheduledShardedFragments(env);
+  const shouldAssemble = shouldAssembleScheduledShardedSnapshots(env);
+  if (!shouldSeed && !shouldAssemble) {
+    return;
+  }
+
+  const monitorLimit = readBoundedPositiveIntegerEnv(
+    env,
+    'UPTIMER_SHARDED_FRAGMENT_SEED_BATCH_SIZE',
+    SHARDED_FRAGMENT_SEED_BATCH_SIZE,
+    1,
+    10,
+  );
+  if (shouldSeed) {
+    await seedShardedPublicSnapshotKindViaService(env, 'homepage', monitorLimit);
+    await seedShardedPublicSnapshotKindViaService(env, 'status', monitorLimit);
+  }
+
+  if (shouldAssemble) {
+    for (const kind of ['homepage', 'status'] as const) {
+      const assembled = await assembleShardedPublicSnapshotViaService(env, kind);
+      console.log(
+        `scheduled: sharded_assemble kind=${kind} assembled=${assembled.assembled === null ? '-' : assembled.assembled ? 1 : 0} monitor_count=${assembled.monitorCount ?? '-'} invalid_count=${assembled.invalidCount ?? '-'} stale_count=${assembled.staleCount ?? '-'} skip=${assembled.skip ?? '-'}`,
+      );
+    }
+  }
 }
 
 async function refreshHomepageSnapshotViaService(
@@ -1395,12 +1586,17 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
   const claimedLeaseExpiresAt = now + LOCK_LEASE_SECONDS;
   const totalStart = performance.now();
   const currentNow = () => Math.floor(Date.now() / 1000);
+  const queueShardedPublicSnapshotWork = () =>
+    runScheduledShardedPublicSnapshotWork(env).catch((err) => {
+      console.warn('scheduled sharded public snapshot work failed', err);
+    });
   const queueHomepageRefresh = (
     runtimeUpdates?: MonitorRuntimeUpdate[],
     runtimeSnapshotBaseline?: PublicMonitorRuntimeSnapshot,
   ) => {
+    let refreshPromise: Promise<void>;
     if (shouldRefreshHomepageDirect(env)) {
-      return runInternalHomepageRefreshCore({
+      refreshPromise = runInternalHomepageRefreshCore({
         env,
         now: currentNow(),
         scheduledRefreshRequest: true,
@@ -1419,30 +1615,32 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
         .catch((err) => {
           console.warn('homepage snapshot: direct refresh failed', err);
         });
+    } else {
+      refreshPromise = env.SELF
+        ? refreshHomepageSnapshotViaService(
+            env,
+            runtimeUpdates ? { runtimeUpdates } : undefined,
+          )
+            .then(async (result) => {
+              if (!runtimeUpdates?.length || result.refreshed !== false) {
+                return;
+              }
+              await refreshHomepageSnapshotInline(env, currentNow()).catch((fallbackErr) => {
+                console.warn('homepage snapshot: refresh failed', fallbackErr);
+              });
+            })
+            .catch(async (err) => {
+              console.warn('homepage snapshot: service refresh failed', err);
+              await refreshHomepageSnapshotInline(env, currentNow()).catch((fallbackErr) => {
+                console.warn('homepage snapshot: refresh failed', fallbackErr);
+              });
+            })
+        : refreshHomepageSnapshotInline(env, currentNow()).catch((err) => {
+            console.warn('homepage snapshot: refresh failed', err);
+          });
     }
 
-    return env.SELF
-      ? refreshHomepageSnapshotViaService(
-          env,
-          runtimeUpdates ? { runtimeUpdates } : undefined,
-        )
-          .then(async (result) => {
-            if (!runtimeUpdates?.length || result.refreshed !== false) {
-              return;
-            }
-            await refreshHomepageSnapshotInline(env, currentNow()).catch((fallbackErr) => {
-              console.warn('homepage snapshot: refresh failed', fallbackErr);
-            });
-          })
-          .catch(async (err) => {
-            console.warn('homepage snapshot: service refresh failed', err);
-            await refreshHomepageSnapshotInline(env, currentNow()).catch((fallbackErr) => {
-              console.warn('homepage snapshot: refresh failed', fallbackErr);
-            });
-          })
-      : refreshHomepageSnapshotInline(env, currentNow()).catch((err) => {
-          console.warn('homepage snapshot: refresh failed', err);
-        });
+    return refreshPromise.then(queueShardedPublicSnapshotWork);
   };
 
   const acquired = await acquireLease(env.DB, LOCK_NAME, now, LOCK_LEASE_SECONDS);
