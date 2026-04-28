@@ -24,6 +24,7 @@ export type ShardedPublicSnapshotContinuationResult = {
   step: ShardedPublicSnapshotContinuationStep['step'];
   continued: boolean;
   nextStep?: ShardedPublicSnapshotContinuationStep;
+  nextSteps?: ShardedPublicSnapshotContinuationStep[];
   refreshed?: boolean;
   seeded?: boolean;
   assembled?: boolean;
@@ -98,9 +99,7 @@ function nextSeedStep(opts: {
           monitorOffset: 0,
           monitorLimit: opts.monitorLimit,
         }
-      : opts.kind === 'homepage'
-        ? { step: 'seed', kind: 'status', part: 'envelope', monitorOffset: 0, monitorLimit: opts.monitorLimit }
-        : { step: 'assemble', kind: 'homepage' };
+      : { step: 'assemble', kind: opts.kind };
   }
 
   const nextOffset = opts.monitorOffset + opts.monitorLimit;
@@ -114,13 +113,26 @@ function nextSeedStep(opts: {
     };
   }
 
-  return opts.kind === 'homepage'
-    ? { step: 'seed', kind: 'status', part: 'envelope', monitorOffset: 0, monitorLimit: opts.monitorLimit }
-    : { step: 'assemble', kind: 'homepage' };
+  return { step: 'assemble', kind: opts.kind };
 }
 
-function nextAssembleStep(kind: ShardedPublicSnapshotKind): ShardedPublicSnapshotContinuationStep | null {
-  return kind === 'homepage' ? { step: 'assemble', kind: 'status' } : null;
+function firstSeedSteps(monitorLimit: number): ShardedPublicSnapshotContinuationStep[] {
+  return [
+    {
+      step: 'seed',
+      kind: 'homepage',
+      part: 'envelope',
+      monitorOffset: 0,
+      monitorLimit,
+    },
+    {
+      step: 'seed',
+      kind: 'status',
+      part: 'envelope',
+      monitorOffset: 0,
+      monitorLimit,
+    },
+  ];
 }
 
 function toWireStep(step: ShardedPublicSnapshotContinuationStep): Record<string, unknown> {
@@ -144,34 +156,46 @@ function queueContinuation(
   ctx: ExecutionContext,
   nextStep: ShardedPublicSnapshotContinuationStep | null,
 ): boolean {
-  if (!nextStep || !env.SELF || !env.ADMIN_TOKEN) {
-    return false;
+  return queueContinuations(env, ctx, nextStep ? [nextStep] : []) > 0;
+}
+
+function queueContinuations(
+  env: Env,
+  ctx: ExecutionContext,
+  nextSteps: readonly ShardedPublicSnapshotContinuationStep[],
+): number {
+  if (nextSteps.length === 0 || !env.SELF || !env.ADMIN_TOKEN) {
+    return 0;
   }
 
-  ctx.waitUntil(
-    env.SELF.fetch(
-      new Request(`http://internal${CONTINUATION_PATH}`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${env.ADMIN_TOKEN}`,
-          'Content-Type': 'application/json; charset=utf-8',
-        },
-        body: JSON.stringify(toWireStep(nextStep)),
-      }),
-    )
-      .then(async (res) => {
-        const bodyText = await res.text().catch(() => '');
-        if (!res.ok) {
-          throw new Error(
-            `sharded public snapshot continuation failed: HTTP ${res.status} ${bodyText}`.trim(),
-          );
-        }
-      })
-      .catch((err) => {
-        console.warn('sharded public snapshot continuation dispatch failed', err);
-      }),
-  );
-  return true;
+  let queued = 0;
+  for (const nextStep of nextSteps) {
+    queued += 1;
+    ctx.waitUntil(
+      env.SELF.fetch(
+        new Request(`http://internal${CONTINUATION_PATH}`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${env.ADMIN_TOKEN}`,
+            'Content-Type': 'application/json; charset=utf-8',
+          },
+          body: JSON.stringify(toWireStep(nextStep)),
+        }),
+      )
+        .then(async (res) => {
+          const bodyText = await res.text().catch(() => '');
+          if (!res.ok) {
+            throw new Error(
+              `sharded public snapshot continuation failed: HTTP ${res.status} ${bodyText}`.trim(),
+            );
+          }
+        })
+        .catch((err) => {
+          console.warn('sharded public snapshot continuation dispatch failed', err);
+        }),
+    );
+  }
+  return queued;
 }
 
 export async function runShardedPublicSnapshotContinuation(opts: {
@@ -188,14 +212,9 @@ export async function runShardedPublicSnapshotContinuation(opts: {
       env: opts.env,
       now: opts.now,
     });
-    const nextStep: ShardedPublicSnapshotContinuationStep = {
-      step: 'seed',
-      kind: 'homepage',
-      part: 'envelope',
-      monitorOffset: 0,
-      monitorLimit: readBoundedMonitorLimit(opts.env),
-    };
-    const continued = queueContinuation(opts.env, opts.ctx, nextStep);
+    const nextSteps = firstSeedSteps(readBoundedMonitorLimit(opts.env));
+    const continuedCount = queueContinuations(opts.env, opts.ctx, nextSteps);
+    const continued = continuedCount > 0;
     return {
       ok: result.ok,
       step: 'runtime',
@@ -204,7 +223,7 @@ export async function runShardedPublicSnapshotContinuation(opts: {
       staleCount: result.staleCount,
       monitorCount: result.updateCount,
       continued,
-      ...(continued ? { nextStep } : {}),
+      ...(continued ? { nextSteps: nextSteps.slice(0, continuedCount) } : {}),
       ...(result.skip ? { skipped: result.skip } : {}),
     };
   }
@@ -258,8 +277,6 @@ export async function runShardedPublicSnapshotContinuation(opts: {
     kind: opts.step.kind,
     mode: readAssemblyMode(opts.env),
   });
-  const nextStep = result.ok ? nextAssembleStep(opts.step.kind) : null;
-  const continued = queueContinuation(opts.env, opts.ctx, nextStep);
   return {
     ok: result.ok,
     step: 'assemble',
@@ -268,8 +285,7 @@ export async function runShardedPublicSnapshotContinuation(opts: {
     monitorCount: result.monitorCount,
     invalidCount: result.invalidCount,
     staleCount: result.staleCount,
-    continued,
-    ...(continued && nextStep ? { nextStep } : {}),
+    continued: false,
     ...(result.skip ? { skipped: result.skip } : {}),
     ...(result.error ? { error: true } : {}),
     ...(result.errorName ? { errorName: result.errorName } : {}),

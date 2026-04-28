@@ -332,6 +332,60 @@ describe('internal sharded public snapshot continuation route', () => {
     expect(res.status).toBe(404);
   });
 
+  it('runs the runtime step and queues homepage/status branches in parallel', async () => {
+    const selfRequests: Request[] = [];
+    const env = {
+      DB: createFakeD1Database([
+        {
+          match: 'from public_snapshot_fragments',
+          all: () => [],
+        },
+      ]),
+      ADMIN_TOKEN: 'test-admin-token',
+      UPTIMER_SCHEDULED_SHARDED_CONTINUATION: '1',
+      UPTIMER_SCHEDULED_RUNTIME_FRAGMENT_REFRESH: '1',
+      UPTIMER_SHARDED_FRAGMENT_SEED_BATCH_SIZE: '2',
+      SELF: {
+        fetch: vi.fn(async (request: Request) => {
+          selfRequests.push(request);
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        }),
+      },
+    } as unknown as Env;
+    const waitUntil = vi.fn();
+
+    const res = await worker.fetch(
+      new Request('http://internal/api/v1/internal/continue/sharded-public-snapshot', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer test-admin-token',
+          'Content-Type': 'application/json; charset=utf-8',
+        },
+        body: JSON.stringify({ step: 'runtime' }),
+      }),
+      env,
+      { waitUntil } as unknown as ExecutionContext,
+    );
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({
+      ok: true,
+      step: 'runtime',
+      refreshed: false,
+      continued: true,
+      next_steps: [
+        { step: 'seed', kind: 'homepage', part: 'envelope', monitor_offset: 0, monitor_limit: 2 },
+        { step: 'seed', kind: 'status', part: 'envelope', monitor_offset: 0, monitor_limit: 2 },
+      ],
+    });
+    expect(waitUntil).toHaveBeenCalledTimes(2);
+    await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
+    await expect(Promise.all(selfRequests.map((request) => request.json()))).resolves.toEqual([
+      { step: 'seed', kind: 'homepage', part: 'envelope', monitor_offset: 0, monitor_limit: 2 },
+      { step: 'seed', kind: 'status', part: 'envelope', monitor_offset: 0, monitor_limit: 2 },
+    ]);
+  });
+
   it('runs one bounded seed step and queues the next continuation', async () => {
     const writes: unknown[][] = [];
     const generatedAt = Math.floor(Date.now() / 1000);
@@ -405,7 +459,7 @@ describe('internal sharded public snapshot continuation route', () => {
       monitor_limit: 1,
       write_count: 1,
       continued: true,
-      next_step: { step: 'assemble', kind: 'homepage' },
+      next_step: { step: 'assemble', kind: 'status' },
     });
     expect(writes).toHaveLength(1);
     expect(waitUntil).toHaveBeenCalledTimes(1);
@@ -417,7 +471,7 @@ describe('internal sharded public snapshot continuation route', () => {
     );
     await expect(selfRequests[0]!.json()).resolves.toEqual({
       step: 'assemble',
-      kind: 'homepage',
+      kind: 'status',
     });
   });
 });

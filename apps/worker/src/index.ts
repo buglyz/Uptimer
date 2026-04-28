@@ -534,19 +534,20 @@ async function handleInternalShardedPublicSnapshotContinuation(
             monitorLimit: parsed.data.monitor_limit,
           },
   });
-  const nextStep = result.nextStep
-    ? result.nextStep.step === 'runtime'
+  const toResponseStep = (step: NonNullable<typeof result.nextStep>) =>
+    step.step === 'runtime'
       ? { step: 'runtime' }
-      : result.nextStep.step === 'assemble'
-        ? { step: 'assemble', kind: result.nextStep.kind }
+      : step.step === 'assemble'
+        ? { step: 'assemble', kind: step.kind }
         : {
             step: 'seed',
-            kind: result.nextStep.kind,
-            part: result.nextStep.part,
-            monitor_offset: result.nextStep.monitorOffset ?? 0,
-            monitor_limit: result.nextStep.monitorLimit ?? 5,
-          }
-    : undefined;
+            kind: step.kind,
+            part: step.part,
+            monitor_offset: step.monitorOffset ?? 0,
+            monitor_limit: step.monitorLimit ?? 5,
+          };
+  const nextStep = result.nextStep ? toResponseStep(result.nextStep) : undefined;
+  const nextSteps = result.nextSteps?.map(toResponseStep);
   return buildInternalJsonResponse(
     {
       ok: result.ok,
@@ -568,6 +569,7 @@ async function handleInternalShardedPublicSnapshotContinuation(
       ...(result.errorName ? { error_name: result.errorName } : {}),
       ...(result.errorMessage ? { error_message: result.errorMessage } : {}),
       ...(nextStep ? { next_step: nextStep } : {}),
+      ...(nextSteps && nextSteps.length > 0 ? { next_steps: nextSteps } : {}),
     },
     result.ok,
   );
