@@ -881,6 +881,9 @@ async function handleInternalScheduledCheckBatch(
 
   const ids = [...new Set(parsedBody.ids)];
   const suppressedMonitorIds = new Set(parsedBody.suppressed_monitor_ids ?? []);
+  const trustSchedulerLease = normalizeTruthyHeader(
+    env.UPTIMER_INTERNAL_CHECK_BATCH_TRUST_SCHEDULER_LEASE ?? null,
+  );
   const [{ runExclusivePersistedMonitorBatch }, notificationsModule] = await timeInternalCheckBatchDiagnostic(
     diagnosticsEnabled,
     diagnosticsTimings,
@@ -928,6 +931,7 @@ async function handleInternalScheduledCheckBatch(
         checkedAt: parsedBody.checked_at,
         abortSignal: request.signal,
         suppressedMonitorIds,
+        trustSchedulerLease,
         stateMachineConfig: {
           failuresToDownFromUp: parsedBody.state_failures_to_down_from_up,
           successesToUpFromDown: parsedBody.state_successes_to_up_from_down,

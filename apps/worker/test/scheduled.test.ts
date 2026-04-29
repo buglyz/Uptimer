@@ -1699,6 +1699,57 @@ describe('scheduler/scheduled regression', () => {
     expect(persistedWrites).toBe(0);
   });
 
+  it('can trust the scheduler lease and skip per-batch execution locks', async () => {
+    const checkedAt = Math.floor(Math.floor(Date.now() / 1000) / 60) * 60;
+    const env = createEnv({
+      dueRows: [
+        {
+          id: 1,
+          name: 'API 1',
+          type: 'http',
+          target: 'https://example.com/1',
+          interval_sec: 60,
+          created_at: 1_760_000_001,
+          timeout_ms: 10_000,
+          http_method: 'GET',
+          http_headers_json: null,
+          http_body: null,
+          expected_status_json: null,
+          response_keyword: null,
+          response_keyword_mode: null,
+          response_forbidden_keyword: null,
+          response_forbidden_keyword_mode: null,
+          state_status: 'up',
+          state_last_error: null,
+          last_checked_at: checkedAt - 60,
+          last_changed_at: 1_760_000_000,
+          consecutive_failures: 0,
+          consecutive_successes: 1,
+        },
+      ],
+    });
+
+    const result = await runExclusivePersistedMonitorBatch({
+      db: env.DB,
+      ids: [1],
+      checkedAt,
+      trustSchedulerLease: true,
+      stateMachineConfig: {
+        failuresToDownFromUp: 2,
+        successesToUpFromDown: 2,
+      },
+    });
+
+    expect(acquireLease).not.toHaveBeenCalledWith(
+      env.DB,
+      expect.stringContaining('scheduler:batch:'),
+      expect.any(Number),
+      expect.any(Number),
+    );
+    expect(runHttpCheck).toHaveBeenCalledTimes(1);
+    expect(result.runtimeUpdates).toMatchObject([{ monitor_id: 1 }]);
+  });
+
   it('skips monitor ids already claimed by an overlapping batch execution', async () => {
     const checkedAt = Math.floor(Math.floor(Date.now() / 1000) / 60) * 60;
     const env = createEnv({

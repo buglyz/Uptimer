@@ -1136,11 +1136,40 @@ export async function runExclusivePersistedMonitorBatch(opts: {
   };
   onPersistedMonitor?: (completed: CompletedDueMonitor) => void;
   trace?: Trace;
+  trustSchedulerLease?: boolean;
 }): Promise<MonitorBatchExecutionResult> {
   const ids = normalizePositiveIntegerIds(opts.ids);
   opts.trace?.setLabel('batch_ids', ids.length);
   if (ids.length === 0) {
     return createEmptyMonitorBatchExecutionResult();
+  }
+
+  if (opts.trustSchedulerLease) {
+    opts.trace?.setLabel('batch_lock', 'trusted_scheduler_lease');
+    const rows = opts.trace
+      ? await opts.trace.timeAsync(
+          'batch_list_pending_rows',
+          async () => await listPendingMonitorRowsByIds(opts.db, ids, opts.checkedAt),
+        )
+      : await listPendingMonitorRowsByIds(opts.db, ids, opts.checkedAt);
+    opts.trace?.setLabel('batch_pending_rows', rows.length);
+    if (rows.length === 0) {
+      return createEmptyMonitorBatchExecutionResult();
+    }
+    return await runPersistedMonitorBatch({
+      db: opts.db,
+      rows,
+      checkedAt: opts.checkedAt,
+      stateMachineConfig: opts.stateMachineConfig,
+      ...(opts.suppressedMonitorIds ? { suppressedMonitorIds: opts.suppressedMonitorIds } : {}),
+      ...(opts.onPersistedMonitor ? { onPersistedMonitor: opts.onPersistedMonitor } : {}),
+      ...(opts.trace ? { trace: opts.trace } : {}),
+      beforePersist: () => {
+        if (opts.abortSignal?.aborted) {
+          throw new LeaseLostError('scheduled batch: trusted scheduler lease aborted by caller');
+        }
+      },
+    });
   }
 
   const now = Math.floor(Date.now() / 1000);

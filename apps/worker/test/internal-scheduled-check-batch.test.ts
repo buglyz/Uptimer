@@ -406,6 +406,58 @@ describe('internal scheduled check-batch route', () => {
     ]);
   });
 
+  it('passes trusted scheduler lease mode behind the internal flag', async () => {
+    const now = new Date('2026-04-15T05:18:20.000Z').valueOf();
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    vi.mocked(runExclusivePersistedMonitorBatch).mockResolvedValue({
+      runtimeUpdates: [],
+      stats: {
+        processedCount: 1,
+        rejectedCount: 0,
+        attemptTotal: 1,
+        httpCount: 1,
+        tcpCount: 0,
+        assertionCount: 0,
+        downCount: 0,
+        unknownCount: 0,
+      },
+      checksDurMs: 4,
+      persistDurMs: 2,
+    });
+
+    const env = {
+      DB: createFakeD1Database([]),
+      ADMIN_TOKEN: 'test-admin-token',
+      UPTIMER_INTERNAL_CHECK_BATCH_TRUST_SCHEDULER_LEASE: '1',
+    } as unknown as Env;
+
+    const res = await worker.fetch(
+      new Request('http://internal/api/v1/internal/scheduled/check-batch', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer test-admin-token',
+          'Content-Type': 'application/json; charset=utf-8',
+        },
+        body: JSON.stringify({
+          token: 'test-admin-token',
+          ids: [1],
+          checked_at: 1_776_230_280,
+          state_failures_to_down_from_up: 2,
+          state_successes_to_up_from_down: 2,
+        }),
+      }),
+      env,
+      { waitUntil: vi.fn() } as unknown as ExecutionContext,
+    );
+
+    expect(res.status).toBe(200);
+    expect(runExclusivePersistedMonitorBatch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        trustSchedulerLease: true,
+      }),
+    );
+  });
+
   it('emits bounded check-batch diagnostics when explicitly enabled', async () => {
     const now = new Date('2026-04-15T05:18:20.000Z').valueOf();
     vi.spyOn(Date, 'now').mockReturnValue(now);
