@@ -28,6 +28,7 @@ export type ShardedPublicSnapshotAssembleOptions = {
   mode?: ShardedPublicSnapshotAssemblyMode;
   measureBodyBytes?: boolean;
   publish?: boolean;
+  publishArtifact?: boolean;
   now?: number;
 };
 
@@ -73,6 +74,19 @@ export type ShardedPublicSnapshotSeedResult = {
   error?: boolean;
 };
 
+export type ShardedHomepageArtifactPublishResult = {
+  ok: boolean;
+  published: boolean;
+  artifactPublished: boolean;
+  generatedAt?: number;
+  monitorCount: number;
+  writeCount: number;
+  skip?: 'missing_homepage' | 'stale_homepage' | 'invalid_payload';
+  error?: boolean;
+  errorName?: string;
+  errorMessage?: string;
+};
+
 function measuredBodyBytes(value: unknown, enabled: boolean): number | undefined {
   if (!enabled) {
     return undefined;
@@ -98,6 +112,11 @@ function bodyJsonBytes(bodyJson: string, enabled: boolean): number | undefined {
 }
 
 const RAW_PUBLIC_SNAPSHOT_FUTURE_TOLERANCE_SECONDS = 60;
+const READ_RAW_PUBLIC_SNAPSHOT_SQL = `
+  SELECT generated_at, body_json
+  FROM public_snapshots
+  WHERE key = ?1
+`;
 const UPSERT_RAW_PUBLIC_SNAPSHOT_SQL = `
   INSERT INTO public_snapshots (key, generated_at, body_json, updated_at)
   VALUES (?1, ?2, ?3, ?4)
@@ -108,15 +127,29 @@ const UPSERT_RAW_PUBLIC_SNAPSHOT_SQL = `
   WHERE excluded.generated_at >= public_snapshots.generated_at
     OR public_snapshots.generated_at > ?5
 `;
+type PublicSnapshotPublishKey = 'homepage' | 'homepage:artifact' | 'status';
+const rawPublicSnapshotReadStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
 const rawPublicSnapshotUpsertStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
 
 function publicSnapshotKeyForKind(kind: ShardedPublicSnapshotKind): 'homepage' | 'status' {
   return kind === 'homepage' ? 'homepage' : 'status';
 }
 
+function rawPublicSnapshotReadStatement(
+  db: D1Database,
+  key: PublicSnapshotPublishKey,
+): D1PreparedStatement {
+  const cached = rawPublicSnapshotReadStatementByDb.get(db);
+  const statement = cached ?? db.prepare(READ_RAW_PUBLIC_SNAPSHOT_SQL);
+  if (!cached) {
+    rawPublicSnapshotReadStatementByDb.set(db, statement);
+  }
+  return statement.bind(key);
+}
+
 function rawPublicSnapshotUpsertStatement(
   db: D1Database,
-  key: 'homepage' | 'homepage:artifact' | 'status',
+  key: PublicSnapshotPublishKey,
   generatedAt: number,
   bodyJson: string,
   updatedAt: number,
@@ -138,6 +171,22 @@ function rawPublicSnapshotUpsertStatement(
 function didApplySnapshotWrite(result: D1Result): boolean {
   const changed = result.meta?.changes;
   return typeof changed === 'number' ? changed > 0 : true;
+}
+
+async function readRawPublicSnapshotRow(
+  env: Env,
+  key: PublicSnapshotPublishKey,
+): Promise<{ generated_at: number; body_json: string } | null> {
+  const row = await rawPublicSnapshotReadStatement(env.DB, key)
+    .first<{ generated_at: number; body_json: string }>();
+  if (
+    !row ||
+    !Number.isFinite(row.generated_at) ||
+    typeof row.body_json !== 'string'
+  ) {
+    return null;
+  }
+  return row;
 }
 
 async function publishRawPublicSnapshot(opts: {
@@ -163,12 +212,19 @@ async function publishRawHomepageArtifactSnapshot(opts: {
   generatedAt: number;
   bodyJson: string;
   now: number;
-}): Promise<boolean> {
+}): Promise<ShardedHomepageArtifactPublishResult> {
   let raw: unknown;
   try {
     raw = JSON.parse(opts.bodyJson) as unknown;
   } catch {
-    return false;
+    return {
+      ok: true,
+      published: false,
+      artifactPublished: false,
+      monitorCount: 0,
+      writeCount: 0,
+      skip: 'invalid_payload',
+    };
   }
 
   const [{ publicHomepageResponseSchema }, { buildHomepageRenderArtifact }] = await Promise.all([
@@ -177,7 +233,14 @@ async function publishRawHomepageArtifactSnapshot(opts: {
   ]);
   const parsed = publicHomepageResponseSchema.safeParse(raw);
   if (!parsed.success || parsed.data.generated_at !== opts.generatedAt) {
-    return false;
+    return {
+      ok: true,
+      published: false,
+      artifactPublished: false,
+      monitorCount: 0,
+      writeCount: 0,
+      skip: 'invalid_payload',
+    };
   }
 
   const artifact = buildHomepageRenderArtifact(parsed.data);
@@ -189,7 +252,64 @@ async function publishRawHomepageArtifactSnapshot(opts: {
     JSON.stringify(artifact),
     updatedAt,
   ).run();
-  return didApplySnapshotWrite(result);
+  const published = didApplySnapshotWrite(result);
+  return {
+    ok: true,
+    published,
+    artifactPublished: published,
+    generatedAt: artifact.generated_at,
+    monitorCount: parsed.data.monitors.length,
+    writeCount: published ? 1 : 0,
+  };
+}
+
+export async function publishHomepageArtifactSnapshotFromPublishedHomepage(opts: {
+  env: Env;
+  now: number;
+  generatedAt?: number;
+}): Promise<ShardedHomepageArtifactPublishResult> {
+  try {
+    const row = await readRawPublicSnapshotRow(opts.env, 'homepage');
+    if (!row) {
+      return {
+        ok: true,
+        published: false,
+        artifactPublished: false,
+        monitorCount: 0,
+        writeCount: 0,
+        skip: 'missing_homepage',
+      };
+    }
+    if (opts.generatedAt !== undefined && row.generated_at < opts.generatedAt) {
+      return {
+        ok: true,
+        published: false,
+        artifactPublished: false,
+        generatedAt: row.generated_at,
+        monitorCount: 0,
+        writeCount: 0,
+        skip: 'stale_homepage',
+      };
+    }
+    return await publishRawHomepageArtifactSnapshot({
+      env: opts.env,
+      generatedAt: row.generated_at,
+      bodyJson: row.body_json,
+      now: opts.now,
+    });
+  } catch (err) {
+    console.warn('internal sharded homepage artifact publish failed', err);
+    const errorInfo = toErrorInfo(err);
+    return {
+      ok: false,
+      published: false,
+      artifactPublished: false,
+      monitorCount: 0,
+      writeCount: 0,
+      error: true,
+      ...errorInfo,
+    };
+  }
 }
 
 function normalizeSliceBounds(offset: number | undefined, limit: number | undefined): {
@@ -375,14 +495,16 @@ export async function assembleShardedPublicSnapshot(
             now: publishNow,
           })
         : false;
-      const artifactPublished = opts.publish && opts.kind === 'homepage'
+      const shouldPublishArtifact = (opts.publishArtifact ?? true) && opts.kind === 'homepage';
+      const artifactResult = opts.publish && shouldPublishArtifact
         ? await publishRawHomepageArtifactSnapshot({
             env: opts.env,
             generatedAt: assembled.generatedAt,
             bodyJson: assembled.bodyJson,
             now: publishNow,
           })
-        : false;
+        : null;
+      const artifactPublished = artifactResult?.artifactPublished ?? false;
       return {
         ok: true,
         assembled: true,
@@ -398,7 +520,7 @@ export async function assembleShardedPublicSnapshot(
         ...(opts.publish
           ? {
               published,
-              ...(opts.kind === 'homepage' ? { artifactPublished } : {}),
+              ...(shouldPublishArtifact ? { artifactPublished } : {}),
               writeCount: (published ? 1 : 0) + (artifactPublished ? 1 : 0),
             }
           : {}),

@@ -231,6 +231,11 @@ const internalShardedPublicSnapshotContinuationBodySchema = z.discriminatedUnion
     step: z.literal('assemble'),
     kind: z.enum(['homepage', 'status']),
   }),
+  z.object({
+    step: z.literal('artifact'),
+    kind: z.literal('homepage'),
+    generated_at: z.number().int().min(0).optional(),
+  }),
 ]);
 
 type InternalScheduledCheckBatchBody = {
@@ -637,13 +642,21 @@ async function handleInternalShardedPublicSnapshotContinuation(
         }
       : parsed.data.step === 'assemble'
         ? { step: 'assemble', kind: parsed.data.kind }
-        : {
-            step: 'seed',
-            kind: parsed.data.kind,
-            part: parsed.data.part,
-            monitorOffset: parsed.data.monitor_offset,
-            monitorLimit: parsed.data.monitor_limit,
-          },
+        : parsed.data.step === 'artifact'
+          ? {
+              step: 'artifact',
+              kind: 'homepage',
+              ...(parsed.data.generated_at !== undefined
+                ? { generatedAt: parsed.data.generated_at }
+                : {}),
+            }
+          : {
+              step: 'seed',
+              kind: parsed.data.kind,
+              part: parsed.data.part,
+              monitorOffset: parsed.data.monitor_offset,
+              monitorLimit: parsed.data.monitor_limit,
+            },
   });
   const toResponseStep = (step: NonNullable<typeof result.nextStep>) =>
     step.step === 'runtime'
@@ -654,13 +667,19 @@ async function handleInternalShardedPublicSnapshotContinuation(
         }
       : step.step === 'assemble'
         ? { step: 'assemble', kind: step.kind }
-        : {
-            step: 'seed',
-            kind: step.kind,
-            part: step.part,
-            monitor_offset: step.monitorOffset ?? 0,
-            monitor_limit: step.monitorLimit ?? 5,
-          };
+        : step.step === 'artifact'
+          ? {
+              step: 'artifact',
+              kind: step.kind,
+              ...(step.generatedAt !== undefined ? { generated_at: step.generatedAt } : {}),
+            }
+          : {
+              step: 'seed',
+              kind: step.kind,
+              part: step.part,
+              monitor_offset: step.monitorOffset ?? 0,
+              monitor_limit: step.monitorLimit ?? 5,
+            };
   const nextStep = result.nextStep ? toResponseStep(result.nextStep) : undefined;
   const nextSteps = result.nextSteps?.map(toResponseStep);
   return buildInternalJsonResponse(
@@ -677,6 +696,7 @@ async function handleInternalShardedPublicSnapshotContinuation(
         : {}),
       ...(result.kind ? { kind: result.kind } : {}),
       ...(result.part ? { part: result.part } : {}),
+      ...(result.generatedAt !== undefined ? { generated_at: result.generatedAt } : {}),
       ...(result.monitorCount !== undefined ? { monitor_count: result.monitorCount } : {}),
       ...(result.monitorOffset !== undefined ? { monitor_offset: result.monitorOffset } : {}),
       ...(result.monitorLimit !== undefined ? { monitor_limit: result.monitorLimit } : {}),

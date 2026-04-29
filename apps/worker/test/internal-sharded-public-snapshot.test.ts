@@ -686,6 +686,134 @@ describe('internal sharded public snapshot continuation route', () => {
       kind: 'status',
     });
   });
+
+  it('publishes homepage JSON in assemble and queues artifact publishing separately', async () => {
+    const writes: unknown[][] = [];
+    const selfRequests: Request[] = [];
+    const waitUntil = vi.fn();
+    const continuationResponse = new Response(JSON.stringify({ ok: true }), { status: 200 });
+    const continuationBodyRead = vi.spyOn(continuationResponse, 'text');
+    const env = {
+      ...createFragmentEnv([
+        {
+          match: 'insert into public_snapshots',
+          run: (args) => {
+            writes.push(args);
+            return { meta: { changes: 1 } };
+          },
+        },
+      ]),
+      UPTIMER_SCHEDULED_SHARDED_CONTINUATION: '1',
+      UPTIMER_SCHEDULED_SHARDED_ASSEMBLER: '1',
+      UPTIMER_PUBLIC_SHARDED_SNAPSHOT_PUBLISH: '1',
+      UPTIMER_SCHEDULED_SHARDED_PUBLISH: '1',
+      UPTIMER_SHARDED_ASSEMBLER_MODE: 'json',
+      SELF: {
+        fetch: vi.fn(async (request: Request) => {
+          selfRequests.push(request);
+          return continuationResponse;
+        }),
+      },
+    } as unknown as Env;
+
+    const res = await worker.fetch(
+      new Request('http://internal/api/v1/internal/continue/sharded-public-snapshot', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer test-admin-token',
+          'Content-Type': 'application/json; charset=utf-8',
+        },
+        body: JSON.stringify({ step: 'assemble', kind: 'homepage' }),
+      }),
+      env,
+      { waitUntil } as unknown as ExecutionContext,
+    );
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({
+      ok: true,
+      step: 'assemble',
+      assembled: true,
+      kind: 'homepage',
+      generated_at: 1_700_000_000,
+      published: true,
+      write_count: 1,
+      continued: true,
+      next_step: { step: 'artifact', kind: 'homepage', generated_at: 1_700_000_000 },
+    });
+    expect(writes.map((args) => args[0])).toEqual(['homepage']);
+    expect(waitUntil).toHaveBeenCalledTimes(1);
+    await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
+    expect(continuationBodyRead).toHaveBeenCalledTimes(1);
+    await expect(selfRequests[0]!.json()).resolves.toEqual({
+      step: 'artifact',
+      kind: 'homepage',
+      generated_at: 1_700_000_000,
+    });
+  });
+
+  it('publishes the homepage artifact in a separate continuation step', async () => {
+    const payload = homepagePayload();
+    const writes: unknown[][] = [];
+    const env = {
+      DB: createFakeD1Database([
+        {
+          match: (sql) => sql.includes('from public_snapshots') && sql.includes('body_json'),
+          first: (args) => {
+            expect(args).toEqual(['homepage']);
+            return {
+              generated_at: payload.generated_at,
+              body_json: JSON.stringify(payload),
+            };
+          },
+        },
+        {
+          match: 'insert into public_snapshots',
+          run: (args) => {
+            writes.push(args);
+            return { meta: { changes: 1 } };
+          },
+        },
+      ]),
+      ADMIN_TOKEN: 'test-admin-token',
+      UPTIMER_SCHEDULED_SHARDED_CONTINUATION: '1',
+      UPTIMER_PUBLIC_SHARDED_SNAPSHOT_PUBLISH: '1',
+      UPTIMER_SCHEDULED_SHARDED_PUBLISH: '1',
+    } as unknown as Env;
+
+    const res = await worker.fetch(
+      new Request('http://internal/api/v1/internal/continue/sharded-public-snapshot', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer test-admin-token',
+          'Content-Type': 'application/json; charset=utf-8',
+        },
+        body: JSON.stringify({
+          step: 'artifact',
+          kind: 'homepage',
+          generated_at: payload.generated_at,
+        }),
+      }),
+      env,
+      { waitUntil: vi.fn() } as unknown as ExecutionContext,
+    );
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({
+      ok: true,
+      step: 'artifact',
+      kind: 'homepage',
+      generated_at: payload.generated_at,
+      published: true,
+      artifact_published: true,
+      write_count: 1,
+      continued: false,
+    });
+    expect(writes.map((args) => args[0])).toEqual(['homepage:artifact']);
+    const artifact = JSON.parse(writes[0]![2] as string) as { preload_html?: string; snapshot?: unknown };
+    expect(artifact.preload_html).toContain('uptimer-preload');
+    expect(artifact.snapshot).toMatchObject({ generated_at: payload.generated_at });
+  });
 });
 
 describe('internal sharded public snapshot fragment seed route', () => {
